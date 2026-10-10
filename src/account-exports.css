@@ -1,0 +1,53 @@
+body:has(.account-exports) { min-width: 320px; }
+.main-content:has(.account-exports) .page-heading { flex-wrap: wrap; gap: 16px; }
+.main-content:has(.account-exports) .page-heading > div { min-width: 0; max-width: 100%; }
+.account-exports { min-width: 0; }
+.account-exports .content-toolbar { flex-wrap: wrap; align-items: center; }
+.account-exports .toolbar-actions { flex-wrap: wrap; }
+.export-filters { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 16px; margin: 24px 0 18px; }
+.export-types.segmented { display: flex; flex-wrap: wrap; margin: 0; padding: 4px; width: auto; }
+.export-types button { display: flex; align-items: center; justify-content: center; gap: 8px; white-space: nowrap; padding: 9px 12px; }
+.export-types button span { font-size: 10px; opacity: .7; }
+.export-search-row { display: flex; flex-wrap: wrap; gap: 10px; min-width: 0; }
+.export-search-row .search-box { width: 235px; max-width: 100%; min-width: 0; }
+.export-search-row .search-box input { min-width: 0; width: 100%; }
+.export-search-row .select-control { max-width: 310px; height: 36px; text-overflow: ellipsis; }
+.export-selection-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; min-height: 44px; padding: 10px 0; color: #8997a7; font-size: 12px; border-top: 1px solid #edf1f4; }
+.export-selection-bar label { display: inline-flex; align-items: center; gap: 8px; color: #52667b; cursor: pointer; }
+.account-exports input[type='checkbox'] { accent-color: #27a977; width: 15px; height: 15px; cursor: pointer; flex-shrink: 0; }
+.account-exports input[type='checkbox']:disabled { cursor: default; }
+.export-clear { background: transparent; padding: 4px 0; color: #269569; font-size: 12px; margin-left: auto; }
+.export-table-wrap { margin-top: 0; max-width: 100%; overflow-x: auto; }
+.export-table { min-width: 600px; }
+.export-table th, .export-table td { padding: 15px 12px; vertical-align: middle; }
+.export-table th { white-space: nowrap; }
+.export-table .export-check-cell { width: 34px; padding-left: 2px; padding-right: 2px; }
+.export-table td strong { display: block; color: #455a70; font-size: 12px; font-weight: 500; }
+.export-table td small { display: block; color: #929eac; font-size: 10px; margin-top: 5px; }
+.export-table td .mono { max-width: 230px; overflow-wrap: anywhere; }
+.export-table .export-email { overflow-wrap: anywhere; max-width: 310px; }
+.export-row-selected { background: #f1faf6; }
+.export-scope { display: inline-flex; padding: 5px 8px; border-radius: 6px; font-size: 11px; white-space: nowrap; color: #64768e; background: #f0f3f7; }
+.export-scope.team { color: #476bb4; background: #edf3ff; }
+.export-ready { display: inline-flex; align-items: center; gap: 5px; color: #289b6e; font-size: 11px; white-space: nowrap; }
+.export-ready.pending { color: #b77b29; }
+.export-footnote { color: #929eac; font-size: 11px; margin: 18px 0 0; line-height: 1.6; }
+.export-delete-note { margin-top: 5px; }
+.export-delete-summary { color: #8d7462; }
+.export-table td .export-delete-policy { white-space: normal; max-width: 220px; line-height: 1.5; }
+.export-error strong { max-width: 100%; overflow-wrap: anywhere; }
+.export-visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+html[data-theme='dark'] .export-selection-bar { border-color: #2d3c48; }
+html[data-theme='dark'] .export-selection-bar label, html[data-theme='dark'] .export-table td strong { color: #c5d1da; }
+html[data-theme='dark'] .export-row-selected { background: #19362c; }
+html[data-theme='dark'] .export-scope { background: #283644; color: #a4b5c5; }
+html[data-theme='dark'] .export-scope.team { background: #243550; color: #9cb8ee; }
+html[data-theme='dark'] .export-ready, html[data-theme='dark'] .export-clear { color: #71d2a7; }
+html[data-theme='dark'] .export-ready.pending { color: #e4b468; }
+html[data-theme='dark'] .export-delete-summary { color: #d1b494; }
+@media (max-width: 720px) {
+  .export-search-row, .export-search-row .search-box, .export-search-row .select-control { width: 100%; max-width: 100%; }
+  .account-exports .content-toolbar h2 { font-size: 17px; }
+  .export-types.segmented { width: 100%; }
+  .export-types button { flex: 1; }
+}

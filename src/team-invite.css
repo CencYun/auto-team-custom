@@ -1,0 +1,90 @@
+.modal.team-invite-modal { width: min(680px, 100%); max-height: calc(100dvh - 40px); overflow: auto; }
+.team-invite-form { min-width: 0; }
+.team-invite-intro { display: flex; gap: 12px; margin-top: 18px; }
+.team-invite-icon { display: grid; place-items: center; flex: 0 0 36px; height: 36px; color: #2f9b74; background: #eaf7f0; border-radius: 9px; }
+.team-invite-intro > div { min-width: 0; }
+.team-invite-intro strong { color: #395169; font-size: 13px; overflow-wrap: anywhere; }
+.team-invite-intro p { margin: 6px 0 0; color: #7e8e9e; font-size: 11px; line-height: 1.75; }
+.team-invite-capacity { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 16px 0 12px; padding: 10px 12px; color: #7e8e9e; background: #f6f9fb; border-radius: 7px; font-size: 11px; }
+.team-invite-capacity strong { color: #328461; font-weight: 600; }
+.team-invite-capacity-actions { display: flex; align-items: center; gap: 10px; }
+.team-invite-reservations { display: grid; gap: 7px; margin: 10px 0 12px; padding: 10px 12px; border: 1px solid #e7edf2; border-radius: 7px; background: #f8fafb; color: #7e8e9e; font-size: 11px; }
+.team-invite-reservation { min-width: 0; }
+.team-invite-reservation + .team-invite-reservation { border-top: 1px solid #e7edf2; padding-top: 7px; }
+.team-invite-reservation-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; }
+.team-invite-reservation-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.team-invite-reservation-actions > span { flex-shrink: 0; }
+.team-invite-reservations strong { min-width: 0; color: #63778a; overflow-wrap: anywhere; font-weight: 500; }
+.team-invite-reservations p { margin: 0; line-height: 1.6; }
+.team-invite-reservations a { color: #328461; }
+.team-invite-cancel-confirm { display: grid; gap: 8px; margin-top: 8px; padding: 10px; border: 1px solid #e9d6b8; border-radius: 6px; background: #fffaf2; color: #94703b; }
+.team-invite-cancel-confirm > div { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.team-invite-cancel-confirm p strong { color: inherit; }
+.team-invite-search { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 11px; border: 1px solid #dfe7ee; border-radius: 7px; color: #95a2b0; background: #fff; }
+.team-invite-search:focus-within { border-color: #83c9ae; box-shadow: 0 0 0 3px rgba(48,177,126,.1); }
+.team-invite-search input { flex: 1; min-width: 0; height: 100%; padding: 0; outline: 0; border: 0; background: transparent; color: #52677b; font-size: 12px; }
+.team-invite-search input::placeholder { color: #96a3b1; }
+.team-invite-list-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 14px 0 9px; color: #8c9aab; font-size: 10px; }
+.team-invite-list-head label { display: flex; align-items: center; gap: 7px; color: #63778a; font-size: 11px; }
+.team-invite-form input[type='checkbox'] { flex: 0 0 auto; width: 15px; height: 15px; margin: 0; accent-color: #2eaa79; }
+.team-invite-candidates { max-height: min(300px, 34dvh); overflow-y: auto; overscroll-behavior: contain; display: grid; gap: 5px; padding: 1px; }
+.team-invite-candidate { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 11px 12px; border: 1px solid #e7edf2; border-radius: 7px; background: #fff; cursor: pointer; }
+.team-invite-candidate:hover { border-color: #bcdccc; background: #fbfefc; }
+.team-invite-candidate.selected { background: #f1faf5; border-color: #b8dfcc; }
+.team-invite-candidate:focus-within { outline: 2px solid #74bfa0; outline-offset: -1px; }
+.team-invite-candidate.unavailable { background: #f8fafb; cursor: not-allowed; }
+.team-invite-candidate.unavailable strong { color: #93a0ae; }
+.team-invite-candidate-copy { flex: 1; min-width: 0; }
+.team-invite-candidate-copy strong { display: block; color: #4c6379; font-size: 11px; font-weight: 600; overflow-wrap: anywhere; }
+.team-invite-candidate-copy small { display: block; margin-top: 4px; color: #97a4b1; font-size: 10px; }
+.team-invite-candidate > svg { flex-shrink: 0; color: #32a279; }
+.team-invite-empty { padding: 28px 14px; color: #98a6b5; border: 1px dashed #dfe7ee; border-radius: 7px; text-align: center; font-size: 11px; }
+.team-invite-note { margin: 10px 0 0; color: #97a3b1; font-size: 10px; line-height: 1.6; }
+.team-invite-feedback { display: flex; align-items: flex-start; gap: 6px; margin: 10px 0 0; color: #a67935; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.team-invite-feedback.error { color: #c35d66; }
+.team-invite-feedback > svg { flex-shrink: 0; margin-top: 1px; }
+.team-invite-results { margin-top: 15px; padding-top: 14px; border-top: 1px solid #e7edf2; }
+.team-invite-result-summary { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; font-size: 11px; }
+.team-invite-result-summary strong { color: #4c6379; }
+.team-invite-result-summary > span { color: #8393a3; font-size: 10px; }
+.team-invite-result-list { max-height: 160px; overflow-y: auto; overscroll-behavior: contain; }
+.team-invite-result { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid #edf1f4; }
+.team-invite-result:last-child { border-bottom: 0; }
+.team-invite-result > div { min-width: 0; }
+.team-invite-result strong { display: block; color: #5b7084; font-size: 11px; font-weight: 500; overflow-wrap: anywhere; }
+.team-invite-result small { display: block; margin-top: 4px; color: #93a1af; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.team-invite-result > span { flex-shrink: 0; color: #8e9aa7; font-size: 10px; line-height: 1.5; }
+.team-invite-result.invited > span, .team-invite-result.already_member > span { color: #2c9c70; }
+.team-invite-result.failed > span { color: #c35d66; }
+.team-invite-foot { padding-top: 14px; border-top: 1px solid #edf1f4; }
+.team-invite-foot .modal-foot-actions { flex-wrap: wrap; justify-content: flex-end; }
+html[data-theme='dark'] .team-invite-intro strong, html[data-theme='dark'] .team-invite-result-summary strong { color: #d0dde5; }
+html[data-theme='dark'] .team-invite-intro p, html[data-theme='dark'] .team-invite-list-head label { color: #a4b4c1; }
+html[data-theme='dark'] .team-invite-icon { background: #254336; color: #87d7b0; }
+html[data-theme='dark'] .team-invite-capacity { background: #202e39; color: #9dacba; }
+html[data-theme='dark'] .team-invite-capacity strong { color: #8ddbb7; }
+html[data-theme='dark'] .team-invite-reservations { background: #1e2a35; border-color: #354552; }
+html[data-theme='dark'] .team-invite-reservations strong { color: #c1d0dc; }
+html[data-theme='dark'] .team-invite-reservations a { color: #8ddbb7; }
+html[data-theme='dark'] .team-invite-reservation + .team-invite-reservation { border-color: #354552; }
+html[data-theme='dark'] .team-invite-cancel-confirm { background: #352e23; border-color: #5b4d37; color: #d7ae73; }
+html[data-theme='dark'] .team-invite-search, html[data-theme='dark'] .team-invite-candidate { background: #1e2a35; border-color: #354552; }
+html[data-theme='dark'] .team-invite-search input, html[data-theme='dark'] .team-invite-candidate-copy strong, html[data-theme='dark'] .team-invite-result strong { color: #c1d0dc; }
+html[data-theme='dark'] .team-invite-candidate:hover, html[data-theme='dark'] .team-invite-candidate.selected { background: #233a30; border-color: #497a63; }
+html[data-theme='dark'] .team-invite-candidate.unavailable { background: #1b2630; }
+html[data-theme='dark'] .team-invite-candidate.unavailable strong { color: #7e909e; }
+html[data-theme='dark'] .team-invite-empty { border-color: #354552; }
+html[data-theme='dark'] .team-invite-results, html[data-theme='dark'] .team-invite-result, html[data-theme='dark'] .team-invite-foot { border-color: #2e3d49; }
+html[data-theme='dark'] .team-invite-result.invited > span, html[data-theme='dark'] .team-invite-result.already_member > span { color: #8ad4af; }
+html[data-theme='dark'] .team-invite-feedback { color: #d7ae73; }
+html[data-theme='dark'] .team-invite-feedback.error, html[data-theme='dark'] .team-invite-result.failed > span { color: #e8939c; }
+@media (max-width: 650px) {
+  .modal.team-invite-modal { max-height: calc(100dvh - 24px); }
+  .team-invite-intro { gap: 9px; }
+  .team-invite-icon { flex-basis: 30px; height: 30px; }
+  .team-invite-candidates { max-height: 28dvh; }
+  .team-invite-list-head { align-items: flex-start; flex-wrap: wrap; }
+  .team-invite-foot { align-items: stretch; flex-direction: column-reverse; }
+  .team-invite-foot .modal-foot-actions { justify-content: stretch; }
+  .team-invite-foot .modal-foot-actions > button { flex: 1 1 auto; }
+}
