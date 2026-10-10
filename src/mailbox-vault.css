@@ -1,0 +1,5 @@
+.mailbox-vault-table { min-width: 600px; }
+.mailbox-vault-table th:nth-child(2) { width: 34%; }
+.mailbox-vault-table th:nth-child(3), .mailbox-vault-table th:nth-child(4) { width: 26%; }
+.mailbox-vault-table th:last-child { width: 76px; }
+.mailbox-vault-table th, .mailbox-vault-table td { padding-top: 11px; padding-bottom: 11px; }
