@@ -21,6 +21,20 @@ Team Rotation is a lightweight local management console for Team workspaces and 
 
 ## Installation
 
+Install [Node.js](https://nodejs.org/) 22.12.0 or a newer compatible version (Node.js 24 LTS recommended) and Git. Run:
+
+```sh
+git clone https://github.com/sheelkiro/auto-team-custom.git
+cd auto-team-custom
+npm ci
+npm run build
+npm run server
+```
+
+Open <http://127.0.0.1:8786/> and sign in with the default password `daixuteam`. You can also select **Code → Download ZIP** on the repository page, extract it, and run the last three commands from the project directory. A fresh installation starts with empty data; import your own accounts and configure service connections. Roxy authorization requires a separate Roxy installation and local API configuration.
+
+## Development
+
 ```powershell
 npm install
 npm run server

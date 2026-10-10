@@ -31,7 +31,21 @@ Team 轮转提供前后端一体的本地管理能力：前端负责 Team 与账
 
 本项目采用 [MIT License](./LICENSE.md) 开源。你可以自由使用、复制、修改、合并、发布和再授权本项目，但请保留原作者版权声明和许可声明。协议不对软件适用性、稳定性或特定用途作任何明示或默示保证；使用项目处理真实账号、凭据和第三方服务时，请自行承担相应的安全、合规与运营责任。
 
-## 启动
+## 下载安装
+
+安装 [Node.js](https://nodejs.org/) 22.12.0 或更高的兼容版本，推荐 Node.js 24 LTS，并安装 Git。在终端运行：
+
+```sh
+git clone https://github.com/sheelkiro/auto-team-custom.git
+cd auto-team-custom
+npm ci
+npm run build
+npm run server
+```
+
+打开 <http://127.0.0.1:8786/>，使用默认密码 `daixuteam` 登录。不使用 Git 时，也可以在仓库页面选择 **Code → Download ZIP**，解压后在项目目录执行最后三条命令。首次启动是空数据，需要自行导入账号和配置服务连接；Roxy 自动授权需要另行安装 Roxy 并配置其本机 API。
+
+## 开发启动
 
 ```powershell
 npm install
@@ -89,7 +103,7 @@ npm run server
 }
 ```
 
-只支持本地 stdio 的客户端可以使用仓库内的桥接命令（同样需要服务端运行）：
+只支持本地 stdio 的客户端可以使用仓库内的桥接命令（同样需要服务端运行）。将 `cwd` 替换为你解压或克隆项目后的实际绝对路径：
 
 ```json
 {
@@ -97,7 +111,7 @@ npm run server
     "team-rotation": {
       "command": "npm",
       "args": ["run", "mcp"],
-      "cwd": "F:/ai-work/gpt-tila-team",
+      "cwd": "/path/to/auto-team-custom",
       "env": { "QUOTA_HUB_MCP_URL": "http://127.0.0.1:8786/mcp" }
     }
   }
