@@ -1,6 +1,6 @@
 # Team Rotation
 
-> **QQ Group: 1105888476**
+> **QQ Group: 1127955876**
 >
 > Welcome to share usage feedback, feature ideas, deployment experience, and open-source contributions.
 
