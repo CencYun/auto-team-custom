@@ -12,6 +12,7 @@ import { openRoxyBrowserSession } from './roxy-browser.mjs';
 
 const serverScript = fileURLToPath(new URL('./index.mjs', import.meta.url));
 const roxyModule = new URL('./roxy-browser.mjs', import.meta.url).href;
+const loginModule = new URL('./openai-login.mjs', import.meta.url).href;
 const proxyChainModule = new URL('./proxy-chain.mjs', import.meta.url).href;
 const puppeteerModule = import.meta.resolve('puppeteer-core');
 const dataKey = 'isolated-roxy-state-encryption-key';
@@ -48,7 +49,8 @@ async function unusedPort() {
 
 async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = false, occupiedProfile = false, sentinelChallenge = false,
   priorFields = {}, browserVerification = false, passwordFailure = null, proxyFlow = false, holdBrowser = false,
-  accountId = 'child_alpha', createFailure = null, chainFlow = false, concurrentAccounts = null, failBrowserFor = [], cleanupFailureFor = [], connectFailureFor = [], holdQuotaFor = [], holdOpenFor = [], timeoutBeforeSessionFor = [] } = {}) {
+  accountId = 'child_alpha', createFailure = null, chainFlow = false, concurrentAccounts = null, failBrowserFor = [], cleanupFailureFor = [], connectFailureFor = [], holdQuotaFor = [], holdOpenFor = [], timeoutBeforeSessionFor = [], profileCapacity = Infinity, remoteProfiles = null, browserFailureSequences = {},
+  deleteFailure = false, deleteStillListed = false, holdDeleteFor = [], tokenFields = {}, openFailureFor = [], unexpectedLoginErrorFor = [] } = {}) {
   const workspaceId = 'target_team_workspace';
   const allChildren = concurrentAccounts || children;
   const account = allChildren.find((child) => child.id === accountId);
@@ -56,21 +58,30 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
   const mothers = teamFlow ? [{ id: 'fixture_mother', email: 'owner@example.test', accountId: workspaceId,
     accessToken: oauthToken({ id: 'owner', email: 'owner@example.test' }, workspaceId, 'team').access_token }] : [];
   const requests = [];
-  const profiles = [{ dirId: 'roxy_profile_a', windowName: 'Fixture profile', windowSortNum: 1 }];
+  const profiles = remoteProfiles ? structuredClone(remoteProfiles) : [{ dirId: 'roxy_profile_a', windowName: 'Fixture profile', windowSortNum: 1,
+    ...(Number.isFinite(profileCapacity) ? { windowRemark: 'auto-team:child:child_alpha' } : {}) }];
   let releaseBrowser;
   const heldBrowsers = new Map();
   const heldQuotas = new Map();
   const heldOpens = new Map();
+  const heldDeletes = new Map();
   const openedProfiles = new Set();
+  const deletedProfiles = new Set();
   const removedMembers = new Set();
   let browserPeak = 0;
+  let profilePeak = profiles.length;
+  let nextProfileId = profiles.length;
   const upstream = createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     if (proxyFlow && ['/api/oauth/oauth2/token', '/oauth/token'].includes(url.pathname)) url.pathname = '/fixture/token';
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
-    requests.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), method: req.method,
-      token: req.headers.token, proxyAuth: req.headers['proxy-authorization'], body: Buffer.concat(chunks).toString() });
+    const tokenPayload = String(req.headers.authorization || '').split('.')[1];
+    const recorded = { path: url.pathname, query: Object.fromEntries(url.searchParams), method: req.method,
+      token: req.headers.token, proxyAuth: req.headers['proxy-authorization'], body: Buffer.concat(chunks).toString(),
+      subject: tokenPayload ? JSON.parse(Buffer.from(tokenPayload, 'base64url')).sub : undefined,
+      ...(url.pathname === '/browser/connection_info' ? { openedProfiles: [...openedProfiles] } : {}) };
+    requests.push(recorded);
     if (url.pathname === '/fixture/browser-held') {
       await new Promise((resolve) => {
         releaseBrowser = resolve;
@@ -86,6 +97,14 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
     }
     if (url.pathname === '/browser/open') {
       const dirId = JSON.parse(Buffer.concat(chunks).toString()).dirId;
+      if (openFailureFor.includes(dirId)) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ code: -1, msg: 'fixture browser startup failed' }));
+      }
+      if (deletedProfiles.has(dirId)) {
+        res.writeHead(409, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ code: -1, msg: 'fixture environment was deleted' }));
+      }
       openedProfiles.add(dirId);
       browserPeak = Math.max(browserPeak, openedProfiles.size);
       if (holdOpenFor.includes(dirId)) await new Promise((resolve) => heldOpens.set(dirId, resolve));
@@ -98,6 +117,30 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
         return res.end(JSON.stringify({ code: -1, msg: 'fixture close failed' }));
       }
     }
+    if (url.pathname === '/browser/delete') {
+      const { workspaceId: requestedWorkspace, dirIds, isSoftDelete } = JSON.parse(recorded.body);
+      recorded.openedProfiles = [...openedProfiles];
+      const stored = (await saved()).state;
+      recorded.persistedJson = stored.children.map((child) => ({ id: child.id,
+        free: Boolean(child.accessToken && child.refreshToken),
+        team: Boolean(child.workspaceTokens?.[workspaceId]?.accessToken && child.workspaceTokens?.[workspaceId]?.refreshToken) }));
+      if (Array.isArray(dirIds) && dirIds.some((dirId) => holdDeleteFor.includes(dirId))) {
+        await new Promise((resolve) => heldDeletes.set(dirIds[0], resolve));
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (requestedWorkspace !== 'roxy_workspace_a' || !Array.isArray(dirIds) || dirIds.length !== 1 || isSoftDelete !== true) {
+        return res.end(JSON.stringify({ code: -1, msg: 'unexpected fixture delete contract' }));
+      }
+      if (deleteFailure) return res.end(JSON.stringify({ code: -1, msg: 'fixture delete failed' }));
+      if (!deleteStillListed) {
+        for (const dirId of dirIds) {
+          const index = profiles.findIndex((profile) => profile.dirId === dirId);
+          if (index >= 0) profiles.splice(index, 1);
+          deletedProfiles.add(dirId);
+        }
+      }
+      return res.end(JSON.stringify({ code: 0, data: null }));
+    }
     if (req.method === 'DELETE' && url.pathname.startsWith(`/backend-api/accounts/${workspaceId}/users/`)) {
       removedMembers.add(decodeURIComponent(url.pathname.split('/').pop()));
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -106,9 +149,11 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
     if (url.pathname === '/browser/create') {
       res.writeHead(200, { 'content-type': 'application/json' });
       if (createFailure) return res.end(JSON.stringify(createFailure));
+      if (profiles.length >= profileCapacity) return res.end(JSON.stringify({ code: -1, msg: '窗口数量已达到上限' }));
       const body = JSON.parse(Buffer.concat(chunks).toString());
-      const created = { dirId: `created_profile_${profiles.length}`, windowName: body.windowName, windowRemark: body.windowRemark };
+      const created = { dirId: `created_profile_${nextProfileId++}`, windowName: body.windowName, windowRemark: body.windowRemark };
       profiles.push(created);
+      profilePeak = Math.max(profilePeak, profiles.length);
       return res.end(JSON.stringify({ code: 0, data: { dirId: created.dirId } }));
     }
     if (browserFlow && url.pathname === '/oauth/authorize') {
@@ -140,16 +185,16 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
     if (apiFailure) return res.end(JSON.stringify({ code: apiFailure.code ?? -1,
       msg: `private-upstream-error ${secret} http://private-user:private-password@remote.example.test`, data: null }));
     const recognized = ['/health', '/browser/workspace', '/browser/list_v3', '/browser/connection_info',
-      '/browser/open', '/browser/close', '/browser/mdf', '/fixture/browser-options', '/fixture/browser-launch', '/fixture/browser-connect', '/fixture/token', '/fixture/chain-create', '/fixture/chain-close',
+      '/browser/open', '/browser/close', '/browser/mdf', '/fixture/browser-options', '/fixture/browser-launch', '/fixture/browser-connect', '/fixture/context-create', '/fixture/context-close', '/fixture/context-auth', '/fixture/token', '/fixture/chain-create', '/fixture/chain-close',
       `/backend-api/accounts/${workspaceId}/users`, '/backend-api/wham/usage'].includes(url.pathname);
     const data = url.pathname === '/health' ? { running: true }
       : url.pathname === '/browser/workspace' ? { total: 1, rows: [{ id: 'roxy_workspace_a', workspaceName: 'Fixture team' }] }
         : url.pathname === '/browser/list_v3' ? { total: profiles.length, rows: profiles }
           : url.pathname === '/browser/connection_info' ? (occupiedProfile ? [{ dirId: 'roxy_profile_a' }] : [...openedProfiles].map((dirId) => ({ dirId })))
             : url.pathname === '/browser/open' ? { ws: `ws://127.0.0.1:${serverPort}/devtools/browser/fixture` }
-              : url.pathname === '/fixture/token' ? oauthToken(concurrentAccounts
+              : url.pathname === '/fixture/token' ? { ...oauthToken(concurrentAccounts
                 ? allChildren.find((child) => new URLSearchParams(Buffer.concat(chunks).toString()).get('code') === `fixture-automatic-code-${child.email}`) || account : account,
-                teamFlow ? workspaceId : undefined, teamFlow ? 'team' : 'free')
+                teamFlow ? workspaceId : undefined, teamFlow ? 'team' : 'free'), ...tokenFields }
                 : url.pathname === `/backend-api/accounts/${workspaceId}/users` ? { total: 1 + (concurrentAccounts || [account]).filter((child) => !removedMembers.has(child.id)).length, items: [
                   { id: 'owner', email: 'owner@example.test', role: 'account-owner', seat_type: 'default' },
                   ...(concurrentAccounts || [account]).filter((child) => !removedMembers.has(child.id)).map((child) => ({ id: child.id, email: child.email, role: 'standard-user', seat_type: 'default' })),
@@ -183,11 +228,21 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
     ${browserFlow ? `
     import { registerHooks } from 'node:module';
     registerHooks({ resolve(specifier, context, nextResolve) {
+      if (${unexpectedLoginErrorFor.length > 0} && specifier === './openai-login.mjs') return { url: 'fixture:unexpected-login-error', shortCircuit: true };
       if (specifier === './openai-browser-login.mjs') return { url: 'fixture:roxy-browser-flow', shortCircuit: true };
       if (specifier === './roxy-browser.mjs') return { url: 'fixture:roxy-session', shortCircuit: true };
       if (${chainFlow} && specifier === './proxy-chain.mjs') return { url: 'fixture:proxy-chain', shortCircuit: true };
       return nextResolve(specifier, context);
     }, load(url, context, nextLoad) {
+      if (url === 'fixture:unexpected-login-error') return { format: 'module', shortCircuit: true, source: ${JSON.stringify(`
+        export * from ${JSON.stringify(loginModule)};
+        import { loginFreeAccount as actualLogin } from ${JSON.stringify(loginModule)};
+        export async function loginFreeAccount(options) {
+          const result = await actualLogin(options);
+          if (${JSON.stringify(unexpectedLoginErrorFor)}.includes(options.email)) throw new Error('private-unexpected-login-error');
+          return result;
+        }
+      `)} };
       if (url === 'fixture:proxy-chain') return { format: 'module', shortCircuit: true, source: ${JSON.stringify(`
         export * from ${JSON.stringify(proxyChainModule)};
         export async function createProxyChainRelay(options) {
@@ -202,15 +257,26 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
       if (url === 'fixture:roxy-session') return { format: 'module', shortCircuit: true, source: ${JSON.stringify(`
         export * from ${JSON.stringify(roxyModule)};
         import { openRoxyBrowserSession as actualOpen } from ${JSON.stringify(roxyModule)};
+        let contextSequence = 0;
         export function openRoxyBrowserSession(options) {
           return actualOpen(options, { connect: async () => {
             if (${JSON.stringify(connectFailureFor)}.includes(options.childId)) throw new Error('fixture connection failed');
             return {
-            newPage: async () => ({ close: async () => {} }), disconnect: async () => {},
+            newPage: async () => ({ close: async () => {}, authenticate: async () => {} }), disconnect: async () => {},
+            createBrowserContext: async () => {
+              const context = { contextId: ++contextSequence, childId: options.childId, dirId: options.profile?.dirId };
+              await fetch(${JSON.stringify(`http://127.0.0.1:${roxyPort}/fixture/context-create`)}, { method: 'POST', body: JSON.stringify(context) });
+              return { newPage: async () => ({ close: async () => {}, authenticate: async ({ username }) => {
+                await fetch(${JSON.stringify(`http://127.0.0.1:${roxyPort}/fixture/context-auth`)}, { method: 'POST', body: JSON.stringify({ ...context, username }) });
+              } }), close: async () => {
+                await fetch(${JSON.stringify(`http://127.0.0.1:${roxyPort}/fixture/context-close`)}, { method: 'POST', body: JSON.stringify(context) });
+              } };
+            },
           }; } });
         }
       `)} };
       if (url === 'fixture:roxy-browser-flow') return { format: 'module', shortCircuit: true, source: ${JSON.stringify(`
+        const browserAttempts = new Map();
         export async function completeBrowserOAuth(options) {
           if (typeof options.acquireSession !== 'function') throw Object.assign(new Error('fixture Chrome disabled'), { code: 'fixture_chrome_disabled', status: 409 });
           await fetch(${JSON.stringify(`http://127.0.0.1:${roxyPort}/fixture/browser-options`)}, {
@@ -226,8 +292,17 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
             throw Object.assign(new Error('fixture timeout while opening'), { code: 'browser_oauth_timeout', status: 408, browserRequired: true });
           }
           const session = await acquiring;
+          let authorizationError;
           try {
             if (${holdBrowser}) await fetch(${JSON.stringify(`http://127.0.0.1:${roxyPort}/fixture/browser-held`)} + '?email=' + encodeURIComponent(options.email));
+            const attempt = browserAttempts.get(options.email) || 0;
+            browserAttempts.set(options.email, attempt + 1);
+            const injected = ${JSON.stringify(browserFailureSequences)}[options.email]?.[attempt];
+            if (injected) throw Object.assign(new Error('fixture browser authorization failure'), {
+              code: typeof injected === 'string' ? injected : injected.code,
+              status: typeof injected === 'string' ? 502 : injected.status,
+              browserRequired: true, needsInput: true,
+            });
             if (${browserVerification} || ${JSON.stringify(failBrowserFor)}.includes(options.email)) throw Object.assign(new Error('fixture official verification required'), {
               code: 'browser_verification_required', status: 403, browserRequired: true, needsInput: true,
             });
@@ -235,7 +310,18 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
             callback.searchParams.set('state', options.expectedState);
             callback.searchParams.set('code', ${concurrentAccounts !== null} ? 'fixture-automatic-code-' + options.email : 'fixture-automatic-code');
             return { callbackUrl: callback.toString() };
-          } finally { await session.close({ keepOpen: session.keepOpenOnFailure === true && ${JSON.stringify(failBrowserFor)}.includes(options.email) }); }
+          } catch (error) {
+            authorizationError = error;
+            throw error;
+          } finally {
+            try { await session.close({ keepOpen: session.keepOpenOnFailure === true && ${JSON.stringify(failBrowserFor)}.includes(options.email) }); }
+            catch (error) {
+              // Match the real browser failure path: an unsuccessful close
+              // must not replace the official login error already captured.
+              if (!authorizationError) throw error;
+              options.onProgress('roxy_cleanup_failed');
+            }
+          }
         }
       `)} };
       return nextLoad(url, context);
@@ -292,6 +378,7 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
     for (const release of heldBrowsers.values()) release();
     for (const release of heldQuotas.values()) release();
     for (const release of heldOpens.values()) release();
+    for (const release of heldDeletes.values()) release();
     if (app.exitCode === null && app.signalCode === null) {
       const stopped = new Promise((resolve) => app.once('exit', resolve));
       app.kill();
@@ -351,11 +438,11 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
     assert.equal(started.status, 202, JSON.stringify(started.data));
     return waitJob(started.data.job.id);
   }
-  async function addProxies({ enabled = true } = {}) {
-    const added = await request('/api/proxy/entries', { method: 'POST', body: { values: ['alpha', 'beta', 'gamma'].map(
+  async function addProxies({ enabled = true, names = ['alpha', 'beta', 'gamma'] } = {}) {
+    const added = await request('/api/proxy/entries', { method: 'POST', body: { values: names.map(
       (name) => `http://fixture-proxy-${name}:private-proxy-password@127.0.0.1:${roxyPort}`) } });
     assert.equal(added.status, 200, JSON.stringify(added.data));
-    assert.equal(added.data.added.length, 3);
+    assert.equal(added.data.added.length, names.length);
     const updated = await request('/api/proxy', { method: 'PATCH', body: { enabled, strategy: 'round_robin', maxRetries: 2 } });
     assert.equal(updated.status, 200);
     return added.data.added;
@@ -368,7 +455,8 @@ async function fixture(t, { apiFailure = null, browserFlow = false, teamFlow = f
     throw new Error('isolated Roxy browser did not reach the held authorization stage');
   }
   return { request, patch, config, saved, requests, runJob, waitJob, addProxies, waitBrowser,
-    heldBrowsers, heldQuotas, heldOpens, openedProfiles, browserPeak: () => browserPeak,
+    heldBrowsers, heldQuotas, heldOpens, heldDeletes, openedProfiles, deletedProfiles,
+    remoteProfiles: profiles, browserPeak: () => browserPeak, profilePeak: () => profilePeak,
     releaseAccount: (email) => { heldBrowsers.get(email)?.(); heldBrowsers.delete(email); },
     releaseBrowser: () => releaseBrowser?.(), workspaceId, output: () => output };
 }
@@ -388,6 +476,8 @@ async function waitForFixture(condition, description) {
   assert.fail(description);
 }
 async function configureParallel(app, accounts, concurrency) {
+  app.remoteProfiles.push(...accounts.map((child) => ({ dirId: `profile_${child.id}`,
+    windowName: `Fixture ${child.id}`, windowRemark: `auto-team:child:${child.id}` })));
   const result = await app.patch({ ...app.config, concurrency,
     profiles: accounts.map((child) => ({ childId: child.id, dirId: `profile_${child.id}` })) });
   assert.equal(result.status, 200, JSON.stringify(result.data));
@@ -399,6 +489,925 @@ async function startTeamJob(app, accounts) {
   assert.equal(result.status, 202, JSON.stringify(result.data));
   return result.data.job;
 }
+
+function assertConfirmedClosures(requests) {
+  for (const [index, request] of requests.entries()) {
+    if (request.path !== '/browser/close') continue;
+    const { dirId } = JSON.parse(request.body);
+    const nextOpen = requests.findIndex((entry, next) => next > index && entry.path === '/browser/open'
+      && JSON.parse(entry.body).dirId === dirId);
+    const afterClose = requests.slice(index + 1, nextOpen < 0 ? undefined : nextOpen);
+    assert.ok(afterClose.some((entry) => entry.path === '/browser/connection_info' && entry.query.dirIds === dirId
+      && !entry.openedProfiles.includes(dirId)), `closure of ${dirId} must be confirmed before another account reuses it`);
+  }
+}
+
+for (const concurrency of [1, 3]) test(`nine accounts reuse at most three pooled environments at concurrency ${concurrency} with isolated sessions`, { timeout: 20000 }, async (t) => {
+  const accounts = Array.from({ length: 9 }, (_, i) => ({ id: i ? `pool_child_${i}` : 'child_alpha', email: `pool-${i}@example.test`, password: `private-pool-${i}` }));
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, concurrentAccounts: accounts, profileCapacity: 3,
+    failBrowserFor: [accounts[1].email] });
+  const patched = await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency });
+  assert.equal(patched.status, 200, JSON.stringify(patched.data));
+  const job = await app.waitJob((await startTeamJob(app, accounts)).id);
+  assert.equal(job.succeeded, 8, JSON.stringify(job));
+  assert.equal(job.needsAttention, 1);
+  assert.equal(job.completed, 9);
+  const opened = app.requests.filter((request) => request.path === '/browser/open');
+  assert.equal(opened.length, 9, 'each account runs once');
+  assert.ok(new Set(opened.map((request) => JSON.parse(request.body).dirId)).size <= 3);
+  assert.ok(app.requests.filter((request) => request.path === '/browser/create').length <= 2, 'existing owned environment is reused');
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-create').length, 9);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-close').length, 9);
+  assert.equal(app.openedProfiles.size, 0);
+  assert.ok(app.browserPeak() <= concurrency);
+  assert.ok(job.logs.some((entry) => entry.message.includes('隔离登录会话')));
+  const saved = (await app.saved()).state;
+  for (const account of accounts.filter((item) => item !== accounts[1])) {
+    assert.equal(saved.children.find((item) => item.id === account.id).workspaceTokens[app.workspaceId].accountId, app.workspaceId);
+  }
+  assertNoSecrets(job);
+});
+
+for (const concurrency of [1, 3]) test(`nine legacy dedicated bindings recover a missing pool slot using three existing environments at concurrency ${concurrency}`, { timeout: 20000 }, async (t) => {
+  const accounts = Array.from({ length: 9 }, (_, index) => ({ id: index ? `legacy_child_${index}` : 'child_alpha',
+    email: `legacy-${index}@example.test`, password: `private-legacy-${index}` }));
+  const remoteProfiles = accounts.slice(0, 3).map((child) => ({ dirId: `legacy_profile_${child.id}`,
+    windowName: `AutoTeam ${child.email}`, windowRemark: `auto-team:child:${child.id}` }));
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, holdBrowser: true,
+    concurrentAccounts: accounts, profileCapacity: 3, remoteProfiles });
+  const proxies = await app.addProxies();
+  const legacyBindings = accounts.map((child, index) => ({ childId: child.id, dirId: `legacy_profile_${child.id}`,
+    proxyId: proxies[(index + 1) % proxies.length].id }));
+  const configured = await app.patch({ ...app.config, profileMode: 'dedicated', useProxyPool: true,
+    profiles: legacyBindings, poolProfiles: [{ slot: 0, dirId: 'deleted_pool_profile' }] });
+  assert.equal(configured.status, 200, JSON.stringify(configured.data));
+  assert.equal((await app.patch({ profileMode: 'pooled', poolSize: 3, concurrency })).status, 200);
+  const started = await startTeamJob(app, accounts);
+  assert.equal(started.concurrency, concurrency);
+  await waitForFixture(() => app.heldBrowsers.size === concurrency, 'all configured workers must acquire existing environments');
+  for (const child of accounts) {
+    await waitForFixture(() => app.heldBrowsers.has(child.email), `legacy account ${child.id} must reach its isolated login`);
+    app.releaseAccount(child.email);
+  }
+  const job = await app.waitJob(started.id);
+  assert.equal(job.succeeded, 9, JSON.stringify(job));
+  assert.equal(job.completed, 9);
+  assert.equal(job.needsAttention, 0);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0,
+    'stale local bindings must not cause creation beyond the three existing remote environments');
+  const opened = app.requests.filter((request) => request.path === '/browser/open').map((request) => JSON.parse(request.body));
+  const validIds = new Set(remoteProfiles.map((profile) => profile.dirId));
+  assert.equal(opened.length, 9);
+  assert.ok(opened.every((request) => validIds.has(request.dirId) && request.forceOpen === false));
+  assert.equal(new Set(opened.map((request) => request.dirId)).size, concurrency);
+  assert.equal(app.browserPeak(), concurrency);
+  assert.equal(app.openedProfiles.size, 0);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 9);
+  assertConfirmedClosures(app.requests);
+
+  const contexts = app.requests.filter((request) => request.path === '/fixture/context-create').map((request) => JSON.parse(request.body));
+  const closedContexts = app.requests.filter((request) => request.path === '/fixture/context-close').map((request) => JSON.parse(request.body));
+  assert.equal(contexts.length, 9);
+  assert.equal(new Set(contexts.map((context) => context.contextId)).size, 9, 'each account must receive a fresh browser context');
+  assert.deepEqual(new Set(contexts.map((context) => context.childId)), new Set(accounts.map((child) => child.id)));
+  assert.ok(contexts.every((context) => validIds.has(context.dirId)));
+  assert.deepEqual(closedContexts.toSorted((a, b) => a.contextId - b.contextId), contexts.toSorted((a, b) => a.contextId - b.contextId));
+  const authContexts = app.requests.filter((request) => request.path === '/fixture/context-auth').map((request) => JSON.parse(request.body));
+  assert.equal(authContexts.length, 9);
+  const saved = (await app.saved()).state;
+  assert.deepEqual(saved.settings.integrations.roxy.profiles, legacyBindings);
+  assert.ok(saved.settings.integrations.roxy.poolProfiles.every((profile) => validIds.has(profile.dirId)));
+  for (const [index, child] of accounts.entries()) {
+    const proxyIndex = (index + 1) % proxies.length;
+    const username = `fixture-proxy-${['alpha', 'beta', 'gamma'][proxyIndex]}`;
+    const expectedAuth = `Basic ${Buffer.from(`${username}:private-proxy-password`).toString('base64')}`;
+    const stored = saved.children.find((entry) => entry.id === child.id);
+    assert.equal(stored.roxyProxyId, legacyBindings[index].proxyId);
+    assert.equal(stored.workspaceTokens[app.workspaceId].accountId, app.workspaceId);
+    assert.equal(authContexts.find((context) => context.childId === child.id)?.username, username);
+    const tokenRequests = app.requests.filter((request) => request.path === '/fixture/token'
+      && new URLSearchParams(request.body).get('code') === `fixture-automatic-code-${child.email}`);
+    assert.equal(tokenRequests.length, 1);
+    assert.equal(tokenRequests[0].proxyAuth, expectedAuth);
+    const quotas = app.requests.filter((request) => request.path === '/backend-api/wham/usage' && request.subject === child.id);
+    assert.equal(quotas.length, 1);
+    assert.equal(quotas[0].proxyAuth, expectedAuth, 'quota must retain the account proxy after its browser is closed');
+  }
+  assertNoSecrets(job);
+  assertNoSecrets(app.output());
+});
+
+test('an occupied first pooled slot falls through to an existing idle slot without opening or closing the occupied window', { timeout: 20000 }, async (t) => {
+  const remoteProfiles = ['a', 'b', 'c'].map((name, slot) => ({ dirId: `roxy_profile_${name}`,
+    windowName: `Fixture pool ${slot}`, windowRemark: `auto-team:pool:${slot}` }));
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, occupiedProfile: true, profileCapacity: 3, remoteProfiles });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 1,
+    poolProfiles: remoteProfiles.map((profile, slot) => ({ slot, dirId: profile.dirId })) })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  assert.deepEqual(app.requests.filter((request) => request.path === '/browser/open').map((request) => JSON.parse(request.body).dirId), ['roxy_profile_b']);
+  assert.deepEqual(app.requests.filter((request) => request.path === '/browser/close').map((request) => JSON.parse(request.body).dirId), ['roxy_profile_b']);
+  assertConfirmedClosures(app.requests);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-create').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-close').length, 1);
+  assert.equal(app.browserPeak(), 1);
+  assert.equal(app.openedProfiles.size, 0);
+  assertNoSecrets(job);
+});
+
+test('shrinking a pool from three slots to one reuses an existing higher-slot environment after slot zero disappears', { timeout: 20000 }, async (t) => {
+  const dirId = 'retained_pool_profile';
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 1,
+    remoteProfiles: [{ dirId, windowName: 'Fixture previous pool slot', windowRemark: 'auto-team:pool:1' }] });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 3,
+    poolProfiles: [{ slot: 0, dirId: 'deleted_pool_profile' }, { slot: 1, dirId }] })).status, 200);
+  assert.equal((await app.patch({ poolSize: 1 })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.concurrency, 1);
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  assert.deepEqual(app.requests.filter((request) => request.path === '/browser/open').map((request) => JSON.parse(request.body).dirId), [dirId]);
+  assert.deepEqual((await app.saved()).state.settings.integrations.roxy.poolProfiles, [{ slot: 0, dirId }],
+    'moving the retained environment to slot zero must remove its obsolete higher-slot binding');
+  assert.equal((await app.patch({ headless: true })).status, 200, 'the recovered pool configuration must remain valid on later saves');
+  assertConfirmedClosures(app.requests);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-create').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-close').length, 1);
+  assert.equal(app.openedProfiles.size, 0);
+  assertNoSecrets(job);
+});
+
+test('pooled configuration caps batch concurrency at the environment count and survives partial saves', async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 1, concurrency: 3 })).status, 200);
+  const first = await app.runJob({ scope: 'team', motherId: 'fixture_mother', ids: ['child_alpha'] });
+  assert.equal(first.concurrency, 1);
+  assert.equal(first.succeeded, 1);
+  const before = (await app.saved()).state.settings.integrations.roxy;
+  assert.equal((await app.patch({ concurrency: 2 })).status, 200);
+  const after = (await app.saved()).state.settings.integrations.roxy;
+  assert.deepEqual(after.poolProfiles, before.poolProfiles);
+  assert.equal(after.profileMode, 'pooled');
+  assert.equal(after.poolSize, 1);
+});
+
+test('pooled authorization preserves account proxy routing across new leases, cached RT refresh and quota checks', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, profileCapacity: 3,
+    priorFields: { refreshToken: 'private-fixture-rt-child_alpha' } });
+  const proxies = await app.addProxies();
+  const expectedProxy = proxies[1];
+  const expectedAuth = `Basic ${Buffer.from('fixture-proxy-beta:private-proxy-password').toString('base64')}`;
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, useProxyPool: true,
+    profiles: [{ ...app.config.profiles[0], proxyId: expectedProxy.id }] })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  let stored = (await app.saved()).state;
+  assert.equal(stored.children.find((child) => child.id === 'child_alpha').roxyProxyId, expectedProxy.id);
+  assert.deepEqual(stored.settings.integrations.roxy.poolProfiles, [{ slot: 0, dirId: 'roxy_profile_a' }]);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 1);
+  assert.equal(JSON.parse(app.requests.find((request) => request.path === '/browser/mdf').body).proxyInfo.proxyUserName, 'fixture-proxy-beta');
+  assert.ok(app.requests.some((request) => request.path === '/fixture/token' && request.proxyAuth === expectedAuth));
+  const automaticQuotas = app.requests.filter((request) => request.path === '/backend-api/wham/usage');
+  assert.equal(automaticQuotas.length, 1);
+  assert.equal(automaticQuotas[0].proxyAuth, expectedAuth, 'the initial automatic quota request must retain the account proxy after OAuth releases its browser lease');
+
+  // Keep the saved account proxy but rebuild its pooled lease. The outer
+  // authorization network snapshot predates this newly allocated pool slot.
+  assert.equal((await app.patch({ poolProfiles: [] })).status, 200);
+  const beforeNewLease = app.requests.length;
+  const reacquired = await app.request('/api/children/child_alpha/team-auth', { method: 'POST',
+    body: { motherId: 'fixture_mother', force: true } });
+  assert.equal(reacquired.status, 200, JSON.stringify(reacquired.data));
+  assert.equal(reacquired.data.ok, true);
+  const leasedRequests = app.requests.slice(beforeNewLease);
+  assert.equal(leasedRequests.filter((request) => request.path === '/browser/open').length, 1);
+  assert.ok(leasedRequests.some((request) => request.path === '/fixture/token' && request.proxyAuth === expectedAuth));
+  stored = (await app.saved()).state;
+  assert.equal(stored.children.find((child) => child.id === 'child_alpha').roxyProxyId, expectedProxy.id);
+  assert.deepEqual(stored.settings.integrations.roxy.poolProfiles, [{ slot: 0, dirId: 'roxy_profile_a' }]);
+
+  const beforeCachedRequests = app.requests.length;
+  const refreshed = await app.request('/api/children/child_alpha/acquire', { method: 'POST', body: { mode: 'refresh-at' } });
+  assert.equal(refreshed.status, 200, JSON.stringify(refreshed.data));
+  assert.equal(refreshed.data.source, 'refresh_token');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const quota = await app.request('/api/children/child_alpha/team-quota', { method: 'POST',
+      body: { motherId: 'fixture_mother', workspaceId: app.workspaceId } });
+    assert.equal(quota.status, 200, JSON.stringify(quota.data));
+    assert.equal(quota.data.quota5h, 75);
+    assert.equal(quota.data.quota7d, 90);
+  }
+  const cachedRequests = app.requests.slice(beforeCachedRequests);
+  assert.ok(!cachedRequests.some((request) => request.path.startsWith('/browser/')), 'cached refresh and quota checks must not acquire a Roxy environment');
+  const refreshRequest = cachedRequests.find((request) => request.path === '/fixture/token');
+  assert.equal(new URLSearchParams(refreshRequest?.body).get('grant_type'), 'refresh_token');
+  const routedRequests = cachedRequests.filter((request) => request.path === '/fixture/token' || request.path === '/backend-api/wham/usage');
+  assert.equal(routedRequests.length, 4);
+  assert.ok(routedRequests.every((request) => request.proxyAuth === expectedAuth), 'round-robin must not replace the saved account proxy after its browser lease ends');
+  assert.equal(app.openedProfiles.size, 0);
+  assertNoSecrets(job);
+  assertNoSecrets(reacquired.data);
+  assertNoSecrets(refreshed.data);
+  assertNoSecrets(app.output());
+});
+
+for (const profileMode of ['pooled', 'dedicated']) for (const scope of ['free', 'team']) {
+  test(`${profileMode} ${scope} success deletes only its closed saved environment and retains the account proxy`, { timeout: 20000 }, async (t) => {
+    const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: scope === 'team', profileCapacity: 3 });
+    const proxies = await app.addProxies();
+    assert.equal((await app.patch({ ...app.config, profileMode, poolSize: 3, useProxyPool: true, deleteProfileAfterSuccess: true,
+      profiles: [{ ...app.config.profiles[0], proxyId: proxies[1].id }, { childId: 'child_beta', dirId: 'untouched_beta_profile', proxyId: proxies[2].id }],
+      poolProfiles: [{ slot: 0, dirId: 'roxy_profile_a' }] })).status, 200);
+    const job = await app.runJob({ ids: ['child_alpha'], ...(scope === 'team' ? { scope, motherId: 'fixture_mother' } : {}) });
+    assert.equal(job.succeeded, 1, JSON.stringify(job));
+    assert.equal(job.results[0].roxyCleanup?.deleted, true, 'successful JSON must report released environment capacity');
+    const deleted = app.requests.filter((request) => request.path === '/browser/delete');
+    assert.equal(deleted.length, 1);
+    assert.equal(deleted[0].method, 'POST');
+    assert.deepEqual(JSON.parse(deleted[0].body), { workspaceId: app.config.workspaceId, dirIds: ['roxy_profile_a'], isSoftDelete: true });
+    assert.equal(deleted[0].persistedJson.find((child) => child.id === 'child_alpha')[scope], true,
+      'complete JSON must already be on disk when Roxy receives deletion');
+    assert.deepEqual(deleted[0].openedProfiles, []);
+    const deletionIndex = app.requests.indexOf(deleted[0]);
+    const closedIndex = app.requests.findIndex((request) => request.path === '/browser/close');
+    assert.ok(closedIndex >= 0 && closedIndex < deletionIndex);
+    assert.ok(app.requests.slice(closedIndex + 1, deletionIndex).some((request) => request.path === '/browser/connection_info'
+      && request.query.dirIds === 'roxy_profile_a' && !request.openedProfiles.includes('roxy_profile_a')));
+    const stored = (await app.saved()).state;
+    assert.deepEqual(stored.settings.integrations.roxy.profiles,
+      [{ childId: 'child_beta', dirId: 'untouched_beta_profile', proxyId: proxies[2].id }]);
+    assert.deepEqual(stored.settings.integrations.roxy.poolProfiles, []);
+    assert.equal(stored.children.find((child) => child.id === 'child_alpha').roxyProxyId, proxies[1].id);
+    assert.equal(app.remoteProfiles.length, 0);
+    assert.equal(app.openedProfiles.size, 0);
+    const beforeCached = app.requests.length;
+    const cached = await app.request(scope === 'team' ? '/api/children/child_alpha/team-quota' : '/api/children/child_alpha/acquire', {
+      method: 'POST', body: scope === 'team' ? { motherId: 'fixture_mother', workspaceId: app.workspaceId } : { mode: 'refresh-at' } });
+    assert.equal(cached.status, 200, JSON.stringify(cached.data));
+    const routed = app.requests.slice(beforeCached).filter((request) => ['/fixture/token', '/backend-api/wham/usage'].includes(request.path));
+    assert.equal(routed.length, 1);
+    assert.equal(routed[0].proxyAuth, `Basic ${Buffer.from('fixture-proxy-beta:private-proxy-password').toString('base64')}`);
+    assert.ok(!app.requests.slice(beforeCached).some((request) => request.path.startsWith('/browser/')));
+    assertNoSecrets(job);
+    assertNoSecrets(app.output());
+  });
+}
+
+for (const deletionFailure of ['deleteFailure', 'deleteStillListed']) {
+  test(`${deletionFailure} retains saved JSON and reports a cleanup warning without another authorization`, { timeout: 20000 }, async (t) => {
+    const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 3, [deletionFailure]: true });
+    assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, deleteProfileAfterSuccess: true })).status, 200);
+    const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+    assert.equal(job.succeeded, 1, JSON.stringify(job));
+    assert.equal(job.results[0].status, 'ready');
+    assert.equal(job.results[0].roxyCleanup?.deleted, false);
+    assert.ok(job.logs.some((entry) => entry.status === 'warning'), 'environment release failure must remain visible as a warning');
+    assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 1);
+    assert.equal(app.remoteProfiles.length, 1);
+    assert.equal(app.openedProfiles.size, 0);
+    const saved = (await app.saved()).state;
+    assert.ok(saved.children.find((child) => child.id === 'child_alpha').workspaceTokens[app.workspaceId].refreshToken);
+    assert.deepEqual(saved.settings.integrations.roxy.poolProfiles, [{ slot: 0, dirId: 'roxy_profile_a' }]);
+    const beforeSkip = app.requests.length;
+    const repeated = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother', retryAccount: true });
+    assert.equal(repeated.succeeded, 1, JSON.stringify(repeated));
+    assert.equal(repeated.results[0].reused, true);
+    assert.deepEqual(app.requests.slice(beforeSkip), [], 'saved credentials must skip both reauthorization and unrelated cleanup');
+    assertNoSecrets(job);
+    assertNoSecrets(repeated);
+  });
+}
+
+for (const scenario of ['incomplete-json', 'verification', 'close-failure', 'manual-profile']) {
+  test(`successful-environment deletion is suppressed for ${scenario}`, { timeout: 20000 }, async (t) => {
+    const app = await fixture(t, { browserFlow: true, teamFlow: true,
+      ...(scenario === 'manual-profile' ? {} : { profileCapacity: 3 }),
+      ...(scenario === 'incomplete-json' ? { tokenFields: { refresh_token: '' } } : {}),
+      ...(scenario === 'verification' ? { browserVerification: true } : {}),
+      ...(scenario === 'close-failure' ? { cleanupFailureFor: ['roxy_profile_a'] } : {}) });
+    assert.equal((await app.patch({ ...app.config, profileMode: scenario === 'manual-profile' ? 'dedicated' : 'pooled',
+      poolSize: 3, deleteProfileAfterSuccess: true })).status, 200);
+    const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+    assert.equal(job.succeeded, scenario === 'manual-profile' ? 1 : 0, JSON.stringify(job));
+    assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 0);
+    assert.equal(app.remoteProfiles.length, 1);
+    assert.equal((await app.saved()).state.settings.integrations.roxy.profiles[0].dirId, 'roxy_profile_a');
+    assertNoSecrets(job);
+  });
+}
+
+for (const failure of [
+  { name: 'rejected credentials', code: 'browser_oauth_credentials_rejected', status: 401, profileMode: 'pooled', scope: 'team' },
+  { name: 'official verification', code: 'browser_verification_required', status: 403, profileMode: 'dedicated', scope: 'team' },
+  { name: 'OAuth timeout', code: 'browser_oauth_timeout', status: 408, profileMode: 'pooled', scope: 'free' },
+  { name: 'incomplete JSON', profileMode: 'pooled', scope: 'team' },
+]) test(`failed-environment release recycles ${failure.name} without changing the failed result`, { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: failure.scope === 'team', profileCapacity: 3,
+    ...(failure.code ? { browserFailureSequences: { [children[0].email]: [failure] } } : { tokenFields: { refresh_token: '' } }) });
+  assert.equal((await app.patch({ ...app.config, profileMode: failure.profileMode, poolSize: 3,
+    deleteProfileAfterFailure: true })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], ...(failure.scope === 'team' ? { scope: 'team', motherId: 'fixture_mother' } : {}) });
+  assert.equal(job.succeeded, 0, JSON.stringify(job));
+  assert.ok(['failed', 'needs_attention'].includes(job.results[0].status));
+  if (failure.code) assert.equal(job.results[0].code, failure.code);
+  assert.equal(job.results[0].roxyCleanup?.deleted, true);
+  assert.ok(job.logs.some((entry) => entry.message.includes('回收站') && entry.message.includes('失败')),
+    'release must be visible in the running log without claiming the authorization succeeded');
+  const deleted = app.requests.filter((request) => request.path === '/browser/delete');
+  assert.equal(deleted.length, 1);
+  assert.deepEqual(JSON.parse(deleted[0].body), { workspaceId: app.config.workspaceId, dirIds: ['roxy_profile_a'], isSoftDelete: true });
+  assert.deepEqual(deleted[0].openedProfiles, []);
+  assert.ok(app.requests.findIndex((request) => request.path === '/browser/close') < app.requests.indexOf(deleted[0]));
+  assert.equal(app.openedProfiles.size, 0);
+  assert.equal(app.remoteProfiles.length, 0);
+  const saved = (await app.saved()).state;
+  assert.equal(saved.children.length, children.length, 'releasing browser capacity must preserve local accounts');
+  assert.deepEqual(saved.settings.integrations.roxy.profiles, []);
+  assert.deepEqual(saved.settings.integrations.roxy.poolProfiles || [], []);
+  assertNoSecrets(job);
+  assertNoSecrets(app.output());
+});
+
+test('failed-environment release closes a headed dedicated verification window even when the browser asks to keep it open', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 3, failBrowserFor: [children[0].email] });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'dedicated', headless: false, deleteProfileAfterFailure: true })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.results[0].code, 'browser_verification_required');
+  assert.equal(job.results[0].roxyCleanup?.deleted, true);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 1);
+  assert.equal(app.openedProfiles.size, 0);
+  assert.equal(app.remoteProfiles.length, 0);
+  assertNoSecrets(job);
+});
+
+test('failed-environment release reclaims a newly created environment when Roxy refuses to open it', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 3,
+    accountId: 'child_beta', openFailureFor: ['created_profile_1'] });
+  assert.equal((await app.patch({ ...app.config, deleteProfileAfterFailure: true })).status, 200);
+  const job = await app.runJob({ ids: ['child_beta'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.results[0].code, 'roxy_api_failed');
+  assert.equal(job.results[0].roxyCleanup?.deleted, true);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 1);
+  assert.deepEqual(app.requests.filter((request) => request.path === '/browser/delete').map((request) => JSON.parse(request.body).dirIds), [['created_profile_1']]);
+  assert.deepEqual(app.remoteProfiles.map((profile) => profile.dirId), ['roxy_profile_a']);
+  assert.deepEqual((await app.saved()).state.settings.integrations.roxy.profiles, app.config.profiles);
+  assert.equal(app.openedProfiles.size, 0);
+  assertNoSecrets(job);
+});
+
+test('failed-environment release reclaims an existing owned dedicated environment when Roxy refuses to open it', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 3, openFailureFor: ['roxy_profile_a'] });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'dedicated', deleteProfileAfterFailure: true })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.results[0].code, 'roxy_api_failed');
+  assert.equal(job.results[0].roxyCleanup?.deleted, true);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  const deleted = app.requests.filter((request) => request.path === '/browser/delete');
+  assert.equal(deleted.length, 1);
+  assert.deepEqual(JSON.parse(deleted[0].body).dirIds, ['roxy_profile_a']);
+  assert.deepEqual(deleted[0].openedProfiles, []);
+  assert.equal(app.remoteProfiles.length, 0);
+  assert.deepEqual((await app.saved()).state.settings.integrations.roxy.profiles, []);
+  assertNoSecrets(job);
+});
+
+test('failed-environment release survives an unexpected post-browser exception and reports cleanup on the failed result', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 3,
+    unexpectedLoginErrorFor: [children[0].email] });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', deleteProfileAfterFailure: true })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.succeeded, 0, JSON.stringify(job));
+  assert.equal(job.results[0].status, 'failed');
+  assert.equal(job.results[0].roxyCleanup?.deleted, true, 'an unexpected exception must not lose the successful capacity release report');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 1);
+  assert.equal(app.remoteProfiles.length, 0);
+  assert.equal(app.openedProfiles.size, 0);
+  assert.equal((await app.saved()).state.children[0].workspaceTokens?.[app.workspaceId], undefined);
+  assert.doesNotMatch(JSON.stringify(job), /private-unexpected-login-error/);
+  assertNoSecrets(job);
+});
+
+for (const deletionFailure of ['deleteFailure', 'deleteStillListed']) {
+  test(`failed-environment ${deletionFailure} preserves the login error and leaves the saved binding available for recovery`, { timeout: 20000 }, async (t) => {
+    const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 3, [deletionFailure]: true,
+      browserFailureSequences: { [children[0].email]: [{ code: 'browser_oauth_credentials_rejected', status: 401 }] } });
+    assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', deleteProfileAfterFailure: true })).status, 200);
+    const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+    assert.equal(job.succeeded, 0);
+    assert.equal(job.results[0].code, 'browser_oauth_credentials_rejected');
+    assert.equal(job.results[0].roxyCleanup?.deleted, false);
+    assert.ok(job.logs.some((entry) => entry.status === 'warning'));
+    assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 1);
+    assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 1);
+    assert.equal(app.remoteProfiles.length, 1);
+    assert.equal(app.openedProfiles.size, 0);
+    assert.equal((await app.saved()).state.settings.integrations.roxy.profiles[0].dirId, 'roxy_profile_a');
+    assertNoSecrets(job);
+  });
+}
+
+for (const scenario of ['close-failure', 'manual-profile']) {
+  test(`failed-environment release refuses to delete a ${scenario}`, { timeout: 20000 }, async (t) => {
+    const app = await fixture(t, { browserFlow: true, teamFlow: true,
+      ...(scenario === 'close-failure' ? { profileCapacity: 3, cleanupFailureFor: ['roxy_profile_a'] } : {}),
+      browserFailureSequences: { [children[0].email]: [{ code: 'browser_oauth_credentials_rejected', status: 401 }] } });
+    assert.equal((await app.patch({ ...app.config, profileMode: 'dedicated', deleteProfileAfterFailure: true })).status, 200);
+    const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+    assert.equal(job.succeeded, 0);
+    assert.equal(job.results[0].code, 'browser_oauth_credentials_rejected');
+    assert.equal(job.results[0].roxyCleanup?.deleted, false);
+    assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 0);
+    assert.equal(app.remoteProfiles.length, 1);
+    assert.equal((await app.saved()).state.settings.integrations.roxy.profiles[0].dirId, 'roxy_profile_a');
+    assertNoSecrets(job);
+  });
+}
+
+test('failed-environment release waits through the three-proxy budget and logs allow retrying only the failed account in a new environment', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, concurrentAccounts: children, profileCapacity: 3,
+    browserFailureSequences: { [children[0].email]: Array(3).fill('browser_oauth_proxy_connection_failed') } });
+  const proxies = await app.addProxies();
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 1, useProxyPool: true,
+    deleteProfileAfterSuccess: true, deleteProfileAfterFailure: true,
+    profiles: [{ ...app.config.profiles[0], proxyId: proxies[0].id }] })).status, 200);
+  const initial = await app.waitJob((await startTeamJob(app, children)).id);
+  assert.equal(initial.succeeded, 1, JSON.stringify(initial));
+  const failed = initial.results.find((result) => result.id === children[0].id);
+  assert.equal(failed.code, 'browser_oauth_proxy_connection_failed');
+  assert.equal(failed.roxyCleanup?.deleted, true);
+  const firstDelete = app.requests.findIndex((request) => request.path === '/browser/delete');
+  const priorOpens = app.requests.slice(0, firstDelete).filter((request) => request.path === '/browser/open');
+  assert.equal(priorOpens.length, 3, 'internal proxy retries must finish before deleting their shared environment');
+  assert.ok(priorOpens.every((request) => JSON.parse(request.body).dirId === 'roxy_profile_a'));
+  assert.equal(app.requests.slice(0, firstDelete).filter((request) => request.path === '/browser/create').length, 0);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 2);
+  assert.equal(app.remoteProfiles.length, 0);
+  const beforeRetry = app.requests.length;
+  const retried = await app.runJob({ ids: [children[0].id], scope: 'team', motherId: 'fixture_mother',
+    retryFailed: true, retryJobId: initial.id });
+  assert.equal(retried.succeeded, 1, JSON.stringify(retried));
+  assert.deepEqual(retried.results.map((result) => result.id), [children[0].id]);
+  assert.equal(retried.results[0].roxyCleanup?.deleted, true);
+  const retryRequests = app.requests.slice(beforeRetry);
+  assert.equal(retryRequests.filter((request) => request.path === '/browser/create').length, 1);
+  const retryOpen = retryRequests.filter((request) => request.path === '/browser/open');
+  assert.equal(retryOpen.length, 1);
+  assert.notEqual(JSON.parse(retryOpen[0].body).dirId, 'roxy_profile_a');
+  assert.equal(app.remoteProfiles.length, 0);
+  assert.equal(app.openedProfiles.size, 0);
+  const beforeSkip = app.requests.length;
+  const skipped = await app.runJob({ ids: [children[1].id], scope: 'team', motherId: 'fixture_mother', retryAccount: true });
+  assert.equal(skipped.results[0].reused, true);
+  assert.deepEqual(app.requests.slice(beforeSkip), []);
+  assertNoSecrets(initial);
+  assertNoSecrets(retried);
+});
+
+test('failed-environment release holds the serial queue until deletion is confirmed before the next account starts', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, concurrentAccounts: children, profileCapacity: 3,
+    holdDeleteFor: ['roxy_profile_a'], browserFailureSequences: { [children[0].email]: ['browser_oauth_timeout'] } });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 1,
+    deleteProfileAfterFailure: true, deleteProfileAfterSuccess: true })).status, 200);
+  const started = await startTeamJob(app, children);
+  await waitForFixture(() => app.heldDeletes.has('roxy_profile_a'), 'failed account deletion should remain in flight');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  assert.equal((await app.request(`/api/children/auto-json/${started.id}`)).data.job.status, 'running');
+  app.heldDeletes.get('roxy_profile_a')();
+  const job = await app.waitJob(started.id);
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  assert.equal(job.results.find((result) => result.id === children[0].id).roxyCleanup?.deleted, true);
+  const opens = app.requests.filter((request) => request.path === '/browser/open').map((request) => JSON.parse(request.body).dirId);
+  assert.equal(opens.length, 2);
+  assert.notEqual(opens[0], opens[1]);
+  assert.equal(app.browserPeak(), 1);
+  assert.equal(app.remoteProfiles.length, 0);
+  assertNoSecrets(job);
+});
+
+test('failed-environment release reclaims a closed concurrent account even while another owned window cannot close', { timeout: 20000 }, async (t) => {
+  const remoteProfiles = children.map((child, slot) => ({ dirId: `failure_profile_${slot}`,
+    windowName: `Fixture failed ${child.id}`, windowRemark: `auto-team:pool:${slot}` }));
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, concurrentAccounts: children, holdBrowser: true,
+    profileCapacity: 3, remoteProfiles, cleanupFailureFor: [remoteProfiles[0].dirId],
+    browserFailureSequences: Object.fromEntries(children.map((child) => [child.email,
+      [{ code: 'browser_oauth_credentials_rejected', status: 401 }]])) });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 2,
+    deleteProfileAfterFailure: true, profiles: [],
+    poolProfiles: remoteProfiles.map((profile, slot) => ({ slot, dirId: profile.dirId })) })).status, 200);
+  const started = await startTeamJob(app, children);
+  await waitForFixture(() => app.heldBrowsers.size === 2, 'both accounts must acquire their windows before either fails');
+  app.releaseAccount(children[0].email);
+  let firstResult;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    firstResult = (await app.request(`/api/children/auto-json/${started.id}`)).data.job.results.find((result) => result.id === children[0].id);
+    if (firstResult) break;
+    await delay(20);
+  }
+  assert.equal(firstResult?.code, 'browser_oauth_credentials_rejected');
+  assert.equal(firstResult.roxyCleanup?.deleted, false);
+  assert.equal(app.openedProfiles.has(remoteProfiles[0].dirId), true);
+  app.releaseAccount(children[1].email);
+  const job = await app.waitJob(started.id);
+  const secondResult = job.results.find((result) => result.id === children[1].id);
+  assert.equal(secondResult.code, 'browser_oauth_credentials_rejected');
+  assert.equal(secondResult.roxyCleanup?.deleted, true, 'an unrelated close failure must not block reclaiming this already closed environment');
+  assert.deepEqual(app.requests.filter((request) => request.path === '/browser/delete').map((request) => JSON.parse(request.body).dirIds), [[remoteProfiles[1].dirId]]);
+  assert.deepEqual(app.remoteProfiles.map((profile) => profile.dirId), [remoteProfiles[0].dirId]);
+  assert.deepEqual([...app.openedProfiles], [remoteProfiles[0].dirId]);
+  assertNoSecrets(job);
+});
+
+test('failed-environment release waits for a late browser startup and confirmed closure before removing its environment', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, profileCapacity: 3,
+    holdOpenFor: ['roxy_profile_a'], timeoutBeforeSessionFor: [children[0].email] });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', deleteProfileAfterFailure: true })).status, 200);
+  const started = await startTeamJob(app, [children[0]]);
+  await waitForFixture(() => app.heldOpens.has('roxy_profile_a'), 'Roxy open should remain pending after OAuth timeout');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 0);
+  app.heldOpens.get('roxy_profile_a')();
+  const job = await app.waitJob(started.id);
+  assert.equal(job.results[0].code, 'browser_oauth_timeout');
+  assert.equal(job.results[0].roxyCleanup?.deleted, true);
+  const deletion = app.requests.find((request) => request.path === '/browser/delete');
+  assert.deepEqual(deletion.openedProfiles, []);
+  assert.ok(app.requests.findIndex((request) => request.path === '/browser/close') < app.requests.indexOf(deletion));
+  assert.equal(app.openedProfiles.size, 0);
+  assert.equal(app.remoteProfiles.length, 0);
+  assertNoSecrets(job);
+});
+
+test('deleting saved environments holds all three leases until removal and the next account never reopens a deleted directory', { timeout: 20000 }, async (t) => {
+  const accounts = parallelChildren.slice(0, 4);
+  const remoteProfiles = accounts.slice(0, 3).map((child, slot) => ({ dirId: `delete_profile_${slot}`,
+    windowName: `Fixture delete ${slot}`, windowRemark: `auto-team:pool:${slot}` }));
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, holdBrowser: true,
+    concurrentAccounts: accounts, profileCapacity: 3, remoteProfiles, holdDeleteFor: remoteProfiles.map((profile) => profile.dirId) });
+  const proxies = await app.addProxies();
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 3,
+    useProxyPool: true, deleteProfileAfterSuccess: true,
+    profiles: accounts.map((child, slot) => ({ childId: child.id, dirId: `delete_profile_${slot}`, proxyId: proxies[slot % 3].id })),
+    poolProfiles: remoteProfiles.map((profile, slot) => ({ slot, dirId: profile.dirId })) })).status, 200);
+  const started = await startTeamJob(app, accounts);
+  await waitForFixture(() => app.heldBrowsers.size === 3, 'the first three accounts must occupy separate environments');
+  for (const child of accounts.slice(0, 3)) app.releaseAccount(child.email);
+  await waitForFixture(() => app.heldDeletes.size === 1
+    && app.requests.filter((request) => request.path === '/browser/close').length === 3,
+  'successful accounts must retain their leases while deletion is pending under the provisioning lock');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 3);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  for (const request of app.requests.filter((request) => request.path === '/browser/delete')) {
+    assert.deepEqual(request.openedProfiles.filter((dirId) => JSON.parse(request.body).dirIds.includes(dirId)), []);
+    assert.ok(request.persistedJson.some((child) => child.team));
+  }
+  for (let completed = 0; completed < 3; completed += 1) {
+    await waitForFixture(() => app.heldDeletes.size > 0, 'each owned environment should reach serialized deletion');
+    const [dirId, release] = app.heldDeletes.entries().next().value;
+    release();
+    app.heldDeletes.delete(dirId);
+  }
+  await waitForFixture(() => app.heldBrowsers.has(accounts[3].email), 'the fourth account must create a replacement only after deletion completes');
+  const opened = app.requests.filter((request) => request.path === '/browser/open').map((request) => JSON.parse(request.body).dirId);
+  assert.equal(opened.length, 4);
+  assert.ok(!remoteProfiles.some((profile) => profile.dirId === opened[3]));
+  app.releaseAccount(accounts[3].email);
+  const job = await app.waitJob(started.id);
+  assert.equal(job.succeeded, 4, JSON.stringify(job));
+  assert.ok(job.results.every((result) => result.roxyCleanup?.deleted === true));
+  assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 4);
+  assert.equal(app.remoteProfiles.length, 0);
+  assert.equal(app.browserPeak(), 3);
+  assert.equal(app.profilePeak(), 3, 'saved Roxy environments must never exceed the three-slot capacity');
+  assert.equal(app.openedProfiles.size, 0);
+  assertConfirmedClosures(app.requests);
+  const stored = (await app.saved()).state;
+  assert.deepEqual(stored.settings.integrations.roxy.poolProfiles, []);
+  assert.ok(stored.settings.integrations.roxy.profiles.every((profile) => !app.deletedProfiles.has(profile.dirId)));
+  for (const [index, child] of accounts.entries()) {
+    assert.equal(stored.children.find((entry) => entry.id === child.id).roxyProxyId, proxies[index % 3].id);
+  }
+  assertNoSecrets(job);
+});
+
+test('six accounts with saved Team JSON skip environment deletion even when release-after-success is enabled', { timeout: 20000 }, async (t) => {
+  const workspaceId = 'target_team_workspace';
+  const accounts = Array.from({ length: 6 }, (_, index) => ({ id: index ? `saved_child_${index}` : 'child_alpha',
+    email: `saved-${index}@example.test`, password: `private-saved-${index}` })).map((child) => ({ ...child,
+    workspaceTokens: { [workspaceId]: { accessToken: oauthToken(child, workspaceId, 'team').access_token,
+      refreshToken: `private-fixture-rt-${child.id}` } } }));
+  const remoteProfiles = Array.from({ length: 3 }, (_, slot) => ({ dirId: `other_profile_${slot}`,
+    windowName: `Unrelated saved profile ${slot}`, windowRemark: `auto-team:pool:${slot}` }));
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, concurrentAccounts: accounts, profileCapacity: 3, remoteProfiles });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, deleteProfileAfterSuccess: true,
+    poolProfiles: remoteProfiles.map((profile, slot) => ({ slot, dirId: profile.dirId })) })).status, 200);
+  const job = await app.waitJob((await startTeamJob(app, accounts)).id);
+  assert.equal(job.succeeded, 6, JSON.stringify(job));
+  assert.ok(job.results.every((result) => result.reused === true));
+  assert.deepEqual(app.requests, [], 'cached successful JSON must not inspect, open, close or delete any environment');
+  assert.deepEqual(app.remoteProfiles, remoteProfiles);
+  assertNoSecrets(job);
+});
+
+test('saved-environment cleanup rejects unauthenticated, disabled and malformed requests without contacting Roxy', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t);
+  const route = '/api/integrations/roxy/cleanup-successful';
+  assert.equal((await app.request(route, { method: 'POST', body: { childIds: ['child_alpha'] }, authenticated: false })).status, 401);
+  assert.equal((await app.request(route, { method: 'POST', body: { childIds: ['child_alpha'] } })).status, 409);
+  assert.equal((await app.patch({ ...app.config, deleteProfileAfterSuccess: true })).status, 200);
+  for (const body of [{}, { childIds: [] }, { childIds: 'child_alpha' }, { childIds: null }, { childIds: Array(1001).fill('child_alpha') }]) {
+    const rejected = await app.request(route, { method: 'POST', body });
+    assert.equal(rejected.status, 400, JSON.stringify(rejected.data));
+    assert.equal(rejected.data.code, 'child_ids_required');
+  }
+  assert.deepEqual(app.requests, []);
+});
+
+test('saved-environment cleanup deletes only selected owned profiles with complete JSON and keeps other bindings and proxies', { timeout: 20000 }, async (t) => {
+  const accounts = parallelChildren.slice(0, 3).map((child, index) => ({ ...child,
+    accessToken: oauthToken(child).access_token,
+    ...(index !== 1 ? { refreshToken: `private-fixture-rt-${child.id}` } : {}) }));
+  const remoteProfiles = accounts.map((child, index) => ({ dirId: `saved_cleanup_${index}`, windowName: `Fixture saved ${index}`,
+    ...(index !== 2 ? { windowRemark: `auto-team:child:${child.id}` } : {}) }));
+  const app = await fixture(t, { concurrentAccounts: accounts, remoteProfiles });
+  const proxies = await app.addProxies();
+  assert.equal((await app.patch({ ...app.config, profileMode: 'dedicated', useProxyPool: true, deleteProfileAfterSuccess: true,
+    profiles: accounts.map((child, index) => ({ childId: child.id, dirId: remoteProfiles[index].dirId, proxyId: proxies[index].id })),
+    poolProfiles: [{ slot: 0, dirId: remoteProfiles[0].dirId }] })).status, 200);
+  const result = await app.request('/api/integrations/roxy/cleanup-successful', { method: 'POST',
+    body: { childIds: [...accounts.map((child) => child.id), 'missing_child'] } });
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.deleted, 1);
+  assert.equal(result.data.results.find((entry) => entry.childId === accounts[0].id)?.deleted, true);
+  assert.ok(!result.data.results.some((entry) => entry.childId === accounts[1].id), 'a missing refresh token cannot qualify for environment deletion');
+  assert.equal(result.data.results.find((entry) => entry.childId === accounts[2].id)?.deleted, false, 'an explicitly mapped manual environment must be preserved');
+  assert.deepEqual(app.requests.filter((request) => request.path === '/browser/delete').map((request) => JSON.parse(request.body).dirIds), [[remoteProfiles[0].dirId]]);
+  assert.ok(!app.requests.some((request) => ['/browser/open', '/browser/close', '/fixture/token'].includes(request.path)));
+  assert.deepEqual(app.remoteProfiles.map((profile) => profile.dirId), remoteProfiles.slice(1).map((profile) => profile.dirId));
+  const stored = (await app.saved()).state;
+  assert.deepEqual(stored.settings.integrations.roxy.poolProfiles, []);
+  assert.deepEqual(stored.settings.integrations.roxy.profiles.map((profile) => profile.childId), accounts.slice(1).map((child) => child.id));
+  assert.equal(stored.children.find((child) => child.id === accounts[0].id).roxyProxyId, proxies[0].id);
+  for (const child of accounts.filter((_, index) => index !== 1)) {
+    assert.equal(stored.children.find((entry) => entry.id === child.id).refreshToken, child.refreshToken);
+  }
+  assertNoSecrets(result.data);
+});
+
+test('saved-environment cleanup rejects another cleanup while deletion is pending', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { profileCapacity: 3, holdDeleteFor: ['roxy_profile_a'],
+    priorFields: { accessToken: oauthToken(children[0]).access_token, refreshToken: 'private-fixture-rt-child_alpha' } });
+  assert.equal((await app.patch({ ...app.config, deleteProfileAfterSuccess: true })).status, 200);
+  const body = { childIds: ['child_alpha'] };
+  const first = app.request('/api/integrations/roxy/cleanup-successful', { method: 'POST', body });
+  void first.catch(() => {});
+  await waitForFixture(() => app.heldDeletes.has('roxy_profile_a'), 'the first cleanup should hold the profile deletion operation');
+  const second = await app.request('/api/integrations/roxy/cleanup-successful', { method: 'POST', body });
+  assert.equal(second.status, 409);
+  assert.equal(second.data.code, 'roxy_profile_busy');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 1);
+  app.heldDeletes.get('roxy_profile_a')();
+  assert.equal((await first).data.deleted, 1);
+  assert.equal(app.remoteProfiles.length, 0);
+});
+
+test('saved-environment cleanup rejects requests while an account authorization holds a browser lease', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, holdBrowser: true, profileCapacity: 3 });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, deleteProfileAfterSuccess: true })).status, 200);
+  const started = await startTeamJob(app, [children[0]]);
+  await app.waitBrowser();
+  const beforeCleanup = app.requests.length;
+  const rejected = await app.request('/api/integrations/roxy/cleanup-successful', { method: 'POST', body: { childIds: ['child_alpha'] } });
+  assert.equal(rejected.status, 409);
+  assert.equal(rejected.data.code, 'roxy_profile_busy');
+  assert.deepEqual(app.requests.slice(beforeCleanup), []);
+  app.releaseAccount(children[0].email);
+  assert.equal((await app.waitJob(started.id)).succeeded, 1);
+});
+
+test('saved-environment cleanup ignores credentials belonging to a different account', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { profileCapacity: 3,
+    priorFields: { accessToken: oauthToken(children[1]).access_token, refreshToken: 'private-fixture-rt-child_beta' } });
+  assert.equal((await app.patch({ ...app.config, deleteProfileAfterSuccess: true })).status, 200);
+  const result = await app.request('/api/integrations/roxy/cleanup-successful', { method: 'POST', body: { childIds: ['child_alpha'] } });
+  assert.equal(result.status, 200);
+  assert.equal(result.data.deleted, 0);
+  assert.deepEqual(result.data.results, []);
+  assert.deepEqual(app.requests, []);
+  assert.equal(app.remoteProfiles.length, 1);
+});
+
+test('a new authorization waits for the whole historical cleanup batch before leasing either selected environment', { timeout: 20000 }, async (t) => {
+  const accounts = parallelChildren.slice(0, 3).map((child, index) => ({ ...child,
+    ...(index < 2 ? { accessToken: oauthToken(child).access_token, refreshToken: `private-fixture-rt-${child.id}` } : {}) }));
+  const remoteProfiles = accounts.slice(0, 2).map((child, index) => ({ dirId: `historical_profile_${index}`,
+    windowName: `Historical ${index}`, windowRemark: `auto-team:child:${child.id}` }));
+  const app = await fixture(t, { browserFlow: true, teamFlow: true, holdBrowser: true, concurrentAccounts: accounts,
+    remoteProfiles, profileCapacity: 3, holdDeleteFor: remoteProfiles.map((profile) => profile.dirId) });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 3, deleteProfileAfterSuccess: true,
+    profiles: accounts.slice(0, 2).map((child, index) => ({ childId: child.id, dirId: remoteProfiles[index].dirId })) })).status, 200);
+  const cleanup = app.request('/api/integrations/roxy/cleanup-successful', { method: 'POST',
+    body: { childIds: accounts.slice(0, 2).map((child) => child.id) } });
+  void cleanup.catch(() => {});
+  await waitForFixture(() => app.heldDeletes.has(remoteProfiles[0].dirId), 'historical cleanup must start its first deletion');
+  const started = await startTeamJob(app, [accounts[2]]);
+  let queued = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const current = await app.request(`/api/children/auto-json/${started.id}`);
+    queued = current.data.job.logs.some((entry) => entry.message.includes('等待空闲 Roxy'));
+    if (queued) break;
+    await delay(10);
+  }
+  assert.equal(queued, true, 'the new account should reach the environment queue while cleanup is held');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 0);
+  app.heldDeletes.get(remoteProfiles[0].dirId)();
+  await waitForFixture(() => app.heldDeletes.has(remoteProfiles[1].dirId), 'the cleanup batch must continue to its second selected environment');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 0,
+    'completion of one historical deletion must not let a new authorization lease the next cleanup candidate');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  app.heldDeletes.get(remoteProfiles[1].dirId)();
+  const released = await cleanup;
+  assert.equal(released.status, 200);
+  assert.equal(released.data.deleted, 2);
+  await waitForFixture(() => app.heldBrowsers.has(accounts[2].email), 'the new account should start after the complete cleanup batch finishes');
+  const opened = app.requests.filter((request) => request.path === '/browser/open').map((request) => JSON.parse(request.body).dirId);
+  assert.equal(opened.length, 1);
+  assert.ok(!remoteProfiles.some((profile) => profile.dirId === opened[0]));
+  app.releaseAccount(accounts[2].email);
+  const job = await app.waitJob(started.id);
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  assert.equal(app.requests.filter((request) => request.path === '/browser/delete').length, 3);
+  assert.equal(app.remoteProfiles.length, 0);
+  assertNoSecrets(job);
+  assertNoSecrets(released.data);
+});
+
+for (const profileMode of ['pooled', 'dedicated']) test(`${profileMode} proxy failover closes the first attempt, reserves both proxies and persists the successful route`, { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, holdBrowser: true, profileCapacity: 3,
+    browserFailureSequences: { [children[0].email]: ['browser_oauth_proxy_connection_failed'] } });
+  const proxies = await app.addProxies();
+  assert.equal((await app.patch({ ...app.config, profileMode, poolSize: 3, useProxyPool: true,
+    profiles: [{ ...app.config.profiles[0], proxyId: proxies[0].id }] })).status, 200);
+  const started = await startTeamJob(app, [children[0]]);
+  await app.waitBrowser();
+  app.releaseAccount(children[0].email);
+  await waitForFixture(() => app.requests.filter((request) => request.path === '/browser/mdf').length === 2
+    && app.heldBrowsers.has(children[0].email), 'the second proxy must receive a fresh browser attempt after closure');
+  for (const proxy of proxies.slice(0, 2)) {
+    const deletion = await app.request(`/api/proxy/entries/${proxy.id}`, { method: 'DELETE' });
+    assert.equal(deletion.status, 409, 'all proxies used by the in-flight authorization must remain reserved');
+    assert.equal(deletion.data.code || deletion.data.message, 'proxy_in_use');
+  }
+  app.releaseAccount(children[0].email);
+  const job = await app.waitJob(started.id);
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  assert.equal(job.results[0].quotaChecked, true);
+  const updates = app.requests.filter((request) => request.path === '/browser/mdf').map((request) => JSON.parse(request.body));
+  assert.deepEqual(updates.map((request) => request.proxyInfo.proxyUserName), ['fixture-proxy-alpha', 'fixture-proxy-beta']);
+  assert.deepEqual(updates.map((request) => request.dirId), ['roxy_profile_a', 'roxy_profile_a']);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 2);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 2);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  assertConfirmedClosures(app.requests);
+  const contexts = app.requests.filter((request) => request.path === '/fixture/context-create').map((request) => JSON.parse(request.body));
+  assert.equal(contexts.length, profileMode === 'pooled' ? 2 : 0);
+  assert.equal(new Set(contexts.map((context) => context.contextId)).size, contexts.length);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-close').length, contexts.length);
+  assert.equal(app.browserPeak(), 1);
+  assert.equal(app.openedProfiles.size, 0);
+  const stored = (await app.saved()).state;
+  assert.equal(profileMode === 'pooled' ? stored.children.find((child) => child.id === 'child_alpha').roxyProxyId
+    : stored.settings.integrations.roxy.profiles.find((profile) => profile.childId === 'child_alpha').proxyId, proxies[1].id);
+  const expectedAuth = `Basic ${Buffer.from('fixture-proxy-beta:private-proxy-password').toString('base64')}`;
+  const routed = app.requests.filter((request) => ['/fixture/token', '/backend-api/wham/usage'].includes(request.path));
+  assert.equal(routed.length, 2);
+  assert.ok(routed.every((request) => request.proxyAuth === expectedAuth), 'token exchange and quota must use the successful browser proxy');
+  const beforeQuota = app.requests.length;
+  const quota = await app.request('/api/children/child_alpha/team-quota', { method: 'POST',
+    body: { motherId: 'fixture_mother', workspaceId: app.workspaceId } });
+  assert.equal(quota.status, 200, JSON.stringify(quota.data));
+  assert.ok(app.requests.slice(beforeQuota).filter((request) => request.path === '/backend-api/wham/usage')
+    .every((request) => request.proxyAuth === expectedAuth));
+  assert.ok(!app.requests.slice(beforeQuota).some((request) => request.path.startsWith('/browser/')));
+  for (const proxy of proxies.slice(0, 2)) {
+    assert.equal((await app.request(`/api/proxy/entries/${proxy.id}`, { method: 'DELETE' })).status, 200,
+      'the authorization must release both proxy reservations when it completes');
+  }
+  assertNoSecrets(job);
+  assertNoSecrets(app.output());
+});
+
+test('proxy failover tries at most three distinct proxies per account and lets the next account complete with its own budget', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, concurrentAccounts: children, profileCapacity: 3,
+    browserFailureSequences: { [children[0].email]: Array(4).fill('browser_oauth_proxy_connection_failed'),
+      [children[1].email]: ['browser_oauth_proxy_connection_failed'] } });
+  const proxies = await app.addProxies({ names: ['alpha', 'beta', 'gamma', 'delta'] });
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 1, useProxyPool: true,
+    profiles: children.map((child, index) => ({ childId: child.id, dirId: index ? 'old_beta_profile' : 'roxy_profile_a', proxyId: proxies[0].id })) })).status, 200);
+  const job = await app.waitJob((await startTeamJob(app, children)).id);
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  assert.equal(job.completed, 2);
+  assert.equal(job.results.find((result) => result.id === children[0].id).code, 'browser_oauth_proxy_connection_failed');
+  assert.equal(job.results.find((result) => result.id === children[1].id).quotaChecked, true);
+  const contexts = app.requests.filter((request) => request.path === '/fixture/context-auth').map((request) => JSON.parse(request.body));
+  assert.deepEqual(contexts.filter((context) => context.childId === children[0].id).map((context) => context.username),
+    ['fixture-proxy-alpha', 'fixture-proxy-beta', 'fixture-proxy-gamma']);
+  assert.deepEqual(contexts.filter((context) => context.childId === children[1].id).map((context) => context.username),
+    ['fixture-proxy-alpha', 'fixture-proxy-beta']);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 5);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 5);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-close').length, 5);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  assertConfirmedClosures(app.requests);
+  assert.equal(app.browserPeak(), 1);
+  assert.equal(app.openedProfiles.size, 0);
+  const expectedAuth = `Basic ${Buffer.from('fixture-proxy-beta:private-proxy-password').toString('base64')}`;
+  const routed = app.requests.filter((request) => ['/fixture/token', '/backend-api/wham/usage'].includes(request.path));
+  assert.equal(routed.length, 2);
+  assert.ok(routed.every((request) => request.proxyAuth === expectedAuth));
+  assertNoSecrets(job);
+  assertNoSecrets(app.output());
+});
+
+for (const failure of [
+  { code: 'browser_oauth_failed', status: 403 },
+  { code: 'browser_oauth_verification_required', status: 403 },
+  { code: 'browser_oauth_credentials_rejected', status: 401 },
+]) test(`proxy failover does not change routes after ${failure.code} HTTP ${failure.status}`, { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, profileCapacity: 3,
+    browserFailureSequences: { [children[0].email]: [failure] } });
+  const proxies = await app.addProxies();
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, useProxyPool: true,
+    profiles: [{ ...app.config.profiles[0], proxyId: proxies[0].id }] })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.succeeded, 0);
+  assert.equal(job.results[0].code, failure.code);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/mdf').length, 1);
+  assert.equal((await app.saved()).state.children.find((child) => child.id === 'child_alpha').roxyProxyId, proxies[0].id);
+  assert.ok(!app.requests.some((request) => ['/fixture/token', '/backend-api/wham/usage'].includes(request.path)));
+  assertConfirmedClosures(app.requests);
+  assert.equal(app.openedProfiles.size, 0);
+  assertNoSecrets(job);
+});
+
+test('proxy failover never starts another attempt when the failed browser cannot be confirmed closed', { timeout: 20000 }, async (t) => {
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, profileCapacity: 3,
+    cleanupFailureFor: ['roxy_profile_a'], browserFailureSequences: { [children[0].email]: ['browser_oauth_proxy_connection_failed'] } });
+  const proxies = await app.addProxies();
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, useProxyPool: true,
+    profiles: [{ ...app.config.profiles[0], proxyId: proxies[0].id }] })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.succeeded, 0);
+  assert.equal(job.results[0].code, 'roxy_cleanup_failed');
+  assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/mdf').length, 1);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-close').length, 1);
+  assert.ok(!app.requests.some((request) => ['/fixture/token', '/backend-api/wham/usage'].includes(request.path)));
+  assert.equal(app.browserPeak(), 1);
+  assertNoSecrets(job);
+  assertNoSecrets(app.output());
+});
+
+test('three concurrent proxy failovers reuse their existing pool slots with fresh sessions and never open a fourth environment', { timeout: 20000 }, async (t) => {
+  const accounts = parallelChildren.slice(0, 3);
+  const remoteProfiles = accounts.map((child, slot) => ({ dirId: `retry_profile_${slot}`,
+    windowName: `Fixture retry ${slot}`, windowRemark: `auto-team:pool:${slot}` }));
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, holdBrowser: true,
+    profileCapacity: 3, remoteProfiles, concurrentAccounts: accounts,
+    browserFailureSequences: Object.fromEntries(accounts.map((child) => [child.email, ['browser_oauth_proxy_connection_failed']])) });
+  const proxies = await app.addProxies();
+  assert.equal((await app.patch({ ...app.config, profileMode: 'pooled', poolSize: 3, concurrency: 3, useProxyPool: true,
+    profiles: accounts.map((child, slot) => ({ childId: child.id, dirId: `old_retry_${slot}`, proxyId: proxies[slot].id })),
+    poolProfiles: remoteProfiles.map((profile, slot) => ({ slot, dirId: profile.dirId })) })).status, 200);
+  const started = await startTeamJob(app, accounts);
+  await waitForFixture(() => app.heldBrowsers.size === 3, 'all three initial attempts should hold a pool slot');
+  for (const child of accounts) app.releaseAccount(child.email);
+  await waitForFixture(() => app.requests.filter((request) => request.path === '/browser/open').length === 6
+    && app.heldBrowsers.size === 3, 'all three proxy failovers should reuse the occupied worker slots');
+  assert.equal(app.browserPeak(), 3);
+  for (const child of accounts) app.releaseAccount(child.email);
+  const job = await app.waitJob(started.id);
+  assert.equal(job.succeeded, 3, JSON.stringify(job));
+  const contexts = app.requests.filter((request) => request.path === '/fixture/context-create').map((request) => JSON.parse(request.body));
+  assert.equal(contexts.length, 6);
+  assert.equal(new Set(contexts.map((context) => context.contextId)).size, 6);
+  assert.equal(new Set(contexts.map((context) => context.dirId)).size, 3);
+  for (const child of accounts) {
+    const attempts = contexts.filter((context) => context.childId === child.id);
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0].dirId, attempts[1].dirId, 'proxy failover must preserve its current pool slot');
+  }
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 6);
+  assert.equal(app.requests.filter((request) => request.path === '/fixture/context-close').length, 6);
+  assertConfirmedClosures(app.requests);
+  assert.equal(app.openedProfiles.size, 0);
+  assertNoSecrets(job);
+  assertNoSecrets(app.output());
+});
 
 test('Roxy concurrency partial API saves persist without changing secrets, profiles or protocol concurrency', async (t) => {
   const app = await fixture(t);
@@ -608,7 +1617,7 @@ test('Roxy retains an account-specific chained relay with a headed failed window
     async close() { opened = false; },
   };
   const dependencies = { client: api, connect: async () => ({
-    newPage: async () => ({ close: async () => {} }), disconnect: async () => {},
+    newPage: async () => ({ close: async () => {}, authenticate: async () => {} }), disconnect: async () => {},
   }), createRelay: async (options) => {
     assert.deepEqual(options, { localProxyUrl: 'http://127.0.0.1:7897', upstreamProxyUrl: proxyEntry.url, timeoutMs: 30000 });
     const relay = { url: `http://chain:private-relay-${relays.length}@127.0.0.1:${51000 + relays.length}`,
@@ -1005,6 +2014,37 @@ test('automatic Team JSON selects the target workspace through Roxy and saves on
   assert.equal(app.requests.filter((request) => request.path === '/browser/open').length, 1);
   assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 1);
   assertNoSecrets(job);
+});
+
+test('a deleted dedicated binding recovers the existing account environment and retains its fixed proxy', { timeout: 20000 }, async (t) => {
+  const dirId = 'recovered_profile_alpha';
+  const app = await fixture(t, { browserFlow: true, proxyFlow: true, teamFlow: true, profileCapacity: 1,
+    remoteProfiles: [{ dirId, windowName: 'AutoTeam alpha', windowRemark: 'auto-team:child:child_alpha' }] });
+  const proxies = await app.addProxies();
+  const expectedProxy = proxies[1];
+  assert.equal((await app.patch({ ...app.config, profileMode: 'dedicated', useProxyPool: true,
+    profiles: [{ childId: 'child_alpha', dirId: 'deleted_dedicated_profile', proxyId: expectedProxy.id }] })).status, 200);
+  const job = await app.runJob({ ids: ['child_alpha'], scope: 'team', motherId: 'fixture_mother' });
+  assert.equal(job.succeeded, 1, JSON.stringify(job));
+  assert.equal(job.results[0].quotaChecked, true);
+  assert.equal(app.requests.filter((request) => request.path === '/browser/create').length, 0);
+  const saved = (await app.saved()).state;
+  assert.deepEqual(saved.settings.integrations.roxy.profiles, [{ childId: 'child_alpha', dirId, proxyId: expectedProxy.id }]);
+  assert.deepEqual(app.requests.filter((request) => request.path === '/browser/open').map((request) => JSON.parse(request.body).dirId), [dirId]);
+  const updated = app.requests.filter((request) => request.path === '/browser/mdf').map((request) => JSON.parse(request.body));
+  assert.equal(updated.length, 1);
+  assert.equal(updated[0].dirId, dirId);
+  assert.equal(updated[0].proxyInfo.proxyUserName, 'fixture-proxy-beta');
+  assert.equal(saved.children.find((child) => child.id === 'child_alpha').workspaceTokens[app.workspaceId].accountId, app.workspaceId);
+  const expectedAuth = `Basic ${Buffer.from('fixture-proxy-beta:private-proxy-password').toString('base64')}`;
+  const routed = app.requests.filter((request) => ['/fixture/token', '/backend-api/wham/usage'].includes(request.path));
+  assert.equal(routed.length, 2);
+  assert.ok(routed.every((request) => request.proxyAuth === expectedAuth));
+  assert.equal(app.requests.filter((request) => request.path === '/browser/close').length, 1);
+  assertConfirmedClosures(app.requests);
+  assert.equal(app.openedProfiles.size, 0);
+  assertNoSecrets(job);
+  assertNoSecrets(app.output());
 });
 
 test('an unmapped account creates its own Roxy profile without using the previous account window', { timeout: 20000 }, async (t) => {

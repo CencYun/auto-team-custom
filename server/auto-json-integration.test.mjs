@@ -57,7 +57,7 @@ function assertPublicAutoJsonLogs(job, children) {
   assert.doesNotMatch(JSON.stringify(job.logs), /private-|fixture-automatic-code|manual-team-code|JBSWY3DPEHPK3PXP|upstream-private-message|quota_forbidden_private_upstream_error|proxy-private-|auth\.openai\.com|https?:\/\//);
 }
 
-async function appFixture(t, children, { responses = {}, holdTokens = false, credentialChild = null, challenge = false, mothers = [], teamScenario = null, roxyEnabled = false, concurrency = 2 } = {}) {
+async function appFixture(t, children, { responses = {}, tokenStatuses = {}, holdTokens = false, credentialChild = null, challenge = false, mothers = [], teamScenario = null, roxyEnabled = false, concurrency = 2 } = {}) {
   const grants = [];
   const paths = [];
   const selectedWorkspaces = [];
@@ -95,7 +95,7 @@ async function appFixture(t, children, { responses = {}, holdTokens = false, cre
         ? (selected === teamWorkspaceId ? teamScenario.teamToken || token(credentialChild.email, credentialChild.id, { workspaceId: teamWorkspaceId, plan: 'team' }) : token(credentialChild.email, credentialChild.id))
         : responses[key];
       active -= 1;
-      return json(response || { error: 'invalid_grant', message: `upstream-private-message-${key} http://proxy-private-user:proxy-private-password@proxy.private.fixture:8888` }, response ? 200 : 400);
+      return json(response || { error: 'invalid_grant', message: `upstream-private-message-${key} http://proxy-private-user:proxy-private-password@proxy.private.fixture:8888` }, tokenStatuses[key] || (response ? 200 : 400));
     }
     if (pathname === '/sentinel') return json({ token: 'isolated-sentinel-fixture-token' });
     if (pathname === '/oauth/authorize') {
@@ -209,7 +209,15 @@ async function appFixture(t, children, { responses = {}, holdTokens = false, cre
     const nativeFetch = globalThis.fetch;
     globalThis.fetch = async (input, options) => {
       const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
-      if (url.port === '50000') throw new Error('isolated_test_roxy_api_disabled');
+      if (url.port === '50000') {
+        // Existing bindings are now checked against the remote inventory before
+        // login. Only provide this read-only fixture; real Roxy stays disabled.
+        if (url.hostname === '127.0.0.1' && url.pathname === '/browser/list_v3') {
+          const rows = ${JSON.stringify(children.map((child) => ({ dirId: `fixture-${child.id}`, windowRemark: `auto-team:child:${child.id}` })))};
+          return new Response(JSON.stringify({ code: 0, data: { total: rows.length, rows } }), { headers: { 'content-type': 'application/json' } });
+        }
+        throw new Error('isolated_test_roxy_api_disabled');
+      }
       if (url.hostname === 'auth.openai.com') {
         const pathname = ['/api/oauth/oauth2/token', '/oauth/token'].includes(url.pathname) ? '/token' : url.pathname;
         return nativeFetch(${JSON.stringify(`http://127.0.0.1:${upstreamPort}`)} + pathname + url.search, options);
@@ -698,7 +706,7 @@ test('Team JSON success keeps failed quota explicitly unknown and never fabricat
   assert.ok(job.logs.some((entry) => entry.childId === child.id && entry.stage === 'team_json' && entry.status === 'ready'));
   assert.doesNotMatch(JSON.stringify(job), /quota_forbidden_private_upstream_error|private-quota-team-rt/);
   const requestsBeforeReuse = app.requests.length;
-  const repeated = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother' })).job.id);
+  const repeated = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother', ids: [child.id] })).job.id);
   assert.equal(repeated.succeeded, 1);
   assert.equal(repeated.results[0].reused, true);
   assert.equal(repeated.results[0].quota5h, null);
@@ -731,7 +739,7 @@ test('Team authorization readiness rejects wrong plans, expired or missing expir
   assert.ok(projected.filter((child) => child.id !== valid.id).every((child) => child.teamAuthorizations[0].ready === false));
   assert.equal(projected.find((child) => child.id === valid.id).teamAuthorizations[0].ready, true);
   assert.doesNotMatch(JSON.stringify(projected.map((child) => child.teamAuthorizations)), /private-invalid-team-rt|private-valid-team-rt|private-fixture-signature/);
-  const job = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother' })).job.id);
+  const job = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother', ids: [...children, valid].map((child) => child.id) })).job.id);
   assert.equal(job.results.find((result) => result.id === valid.id).reused, true);
   assert.ok(job.results.filter((result) => result.id !== valid.id).every((result) => result.status !== 'ready' && result.reused === false));
 });
@@ -791,6 +799,170 @@ test('saved exact Team JSON skips all network, pending callbacks and login while
   const saved = (await app.saved()).children[0];
   assert.deepEqual(saved.workspaceTokens, child.workspaceTokens);
   assert.deepEqual(saved.teamAuthSessions, child.teamAuthSessions);
+});
+
+test('default Team batch excludes saved successful JSON and an explicit ready account remains a harmless skip', async (t) => {
+  const workspaceId = 'fixture-team-workspace';
+  const ready = { id: 'batch-ready', email: 'batch-ready@example.test', team: workspaceId, chatgptUserId: 'batch-ready',
+    workspaceTokens: { [workspaceId]: { accessToken: token('batch-ready@example.test', 'batch-ready', { workspaceId, plan: 'team' }).access_token, refreshToken: 'private-batch-ready-rt' } } };
+  const pending = { id: 'batch-pending', email: 'batch-pending@example.test', team: workspaceId };
+  const unrelated = { id: 'batch-unrelated', email: 'batch-unrelated@example.test' };
+  const app = await appFixture(t, [ready, pending, unrelated], { mothers: [teamOwner()], teamScenario: {
+    members: [ownerMember(), { id: pending.id, email: pending.email, role: 'standard-user', seat_type: 'default' }],
+  } });
+  const batch = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother' })).job.id);
+  assert.equal(batch.total, 1);
+  assert.deepEqual(batch.results.map((result) => result.id), [pending.id]);
+  assert.ok(batch.logs.every((entry) => entry.childId !== ready.id && entry.childId !== unrelated.id));
+  assert.deepEqual((await app.saved()).children.find((child) => child.id === ready.id).workspaceTokens, ready.workspaceTokens);
+  const requestCount = app.requests.length;
+  const single = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother', ids: [ready.id], retryAccount: true })).job.id);
+  assert.equal(single.total, 1);
+  assert.equal(single.succeeded, 1);
+  assert.equal(single.results[0].id, ready.id);
+  assert.equal(single.results[0].reused, true);
+  assert.equal(app.requests.length, requestCount);
+});
+
+test('single account retry requires an explicit Team account and cannot expand or mix retry scopes', async (t) => {
+  const children = ['retry-target', 'retry-other'].map((id) => ({ id, email: `${id}@example.test` }));
+  const app = await appFixture(t, children, { mothers: [teamOwner()] });
+  const base = { scope: 'team', motherId: 'fixture-mother', retryAccount: true };
+  for (const body of [
+    base,
+    { ...base, ids: [] },
+    { ...base, ids: [''] },
+    { ...base, ids: children.map((child) => child.id) },
+    { ...base, ids: [children[0].id], scope: 'free' },
+    { ...base, ids: [children[0].id], retryFailed: true },
+    { ...base, ids: [children[0].id], retryFailed: false },
+    { ...base, ids: [children[0].id], retryJobId: 'previous-job' },
+    { ...base, ids: [children[0].id], retryAccount: 'true' },
+  ]) {
+    const result = await app.request('/api/children/auto-json', { method: 'POST', body });
+    assert.equal(result.status, 400);
+    const emptySelection = Array.isArray(body.ids) && !body.ids.some((id) => String(id || '').trim());
+    assert.equal(result.data.message, emptySelection ? 'child_ids_required' : 'invalid_retry_request', JSON.stringify(body));
+  }
+  assert.equal(app.requests.length, 0);
+});
+
+test('single account retry reopens only its paused Team login without an old job ID', async (t) => {
+  const workspaceId = 'fixture-team-workspace';
+  const child = { id: 'single-paused', email: 'single-paused@example.test', password: 'private-single-paused-password', team: workspaceId };
+  const ready = { id: 'single-ready-other', email: 'single-ready-other@example.test', team: workspaceId, chatgptUserId: 'single-ready-other',
+    workspaceTokens: { [workspaceId]: { accessToken: token('single-ready-other@example.test', 'single-ready-other', { workspaceId, plan: 'team' }).access_token, refreshToken: 'private-single-ready-rt' } } };
+  const scenario = { noMfa: true, challengeTeam: true,
+    members: [ownerMember(), { id: child.id, email: child.email, role: 'standard-user', seat_type: 'default' }] };
+  const app = await appFixture(t, [child, ready], { credentialChild: child, mothers: [teamOwner()], roxyEnabled: true, teamScenario: scenario });
+  const body = { scope: 'team', motherId: 'fixture-mother', ids: [child.id] };
+  const first = await app.finish((await app.start(body)).job.id);
+  assert.equal(first.needsAttention, 1);
+  assert.equal(app.paths.filter((pathname) => pathname === '/oauth/authorize').length, 1);
+  const ordinary = await app.finish((await app.start(body)).job.id);
+  assert.equal(ordinary.needsAttention, 1);
+  assert.equal(app.paths.filter((pathname) => pathname === '/oauth/authorize').length, 1);
+  scenario.challengeTeam = false;
+  const repeated = await app.finish((await app.start({ ...body, retryAccount: true })).job.id);
+  assert.equal(repeated.total, 1);
+  assert.equal(repeated.succeeded, 1);
+  assert.equal(repeated.results[0].id, child.id);
+  assert.equal(repeated.results[0].quotaChecked, true);
+  assert.equal(app.paths.filter((pathname) => pathname === '/oauth/authorize').length, 2);
+  assert.ok(repeated.logs.every((entry) => entry.childId === null || entry.childId === child.id));
+  assert.deepEqual((await app.saved()).children.find((entry) => entry.id === ready.id).workspaceTokens, ready.workspaceTokens);
+  const requests = app.requests.length;
+  const finished = await app.finish((await app.start({ ...body, retryAccount: true })).job.id);
+  assert.equal(finished.results[0].reused, true);
+  assert.equal(app.requests.length, requests);
+});
+
+test('expired saved Team JSON renews its own RT and cached quota without membership calls or browser login', async (t) => {
+  const workspaceId = 'fixture-team-workspace';
+  const child = { id: 'expired-team-refresh', email: 'expired-team-refresh@example.test', chatgptUserId: 'expired-team-refresh', team: workspaceId,
+    workspaceHistory: [{ team: workspaceId, status: 'active', quota5h: 0, quota7d: 64, quotaStatus: 'exhausted', quotaUpdatedAt: '2026-01-01T00:00:00.000Z' }],
+    workspaceTokens: { [workspaceId]: { accessToken: token('expired-team-refresh@example.test', 'expired-team-refresh', { workspaceId, plan: 'business', expiresIn: -60 }).access_token, refreshToken: 'private-expired-team-refresh-rt' } },
+    teamLoginStates: { [workspaceId]: { workspaceId, status: 'browser_verification_required', code: 'browser_verification_required', needsInput: true, browserRequired: true } },
+  };
+  const refreshed = token(child.email, child.chatgptUserId, { workspaceId, plan: 'business' });
+  const app = await appFixture(t, [child], { mothers: [teamOwner()], roxyEnabled: true,
+    responses: { 'private-expired-team-refresh-rt': refreshed } });
+  const job = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother', ids: [child.id], retryAccount: true })).job.id);
+  assert.equal(job.succeeded, 1);
+  assert.equal(job.results[0].reused, true);
+  assert.equal(job.results[0].source, 'stored_team_token');
+  assert.equal(job.results[0].quotaCached, true);
+  assert.equal(job.results[0].quotaChecked, false);
+  assert.equal(job.results[0].quota5h, 0);
+  assert.equal(job.results[0].quota7d, 64);
+  assert.deepEqual(app.paths, ['/token']);
+  assert.equal(app.grants[0].type, 'refresh_token');
+  const saved = (await app.saved()).children[0];
+  assert.equal(saved.workspaceTokens[workspaceId].accessToken, refreshed.access_token);
+  assert.equal(saved.workspaceTokens[workspaceId].refreshToken, refreshed.refresh_token);
+  const repeated = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother' })).job.id);
+  assert.equal(repeated.total, 0);
+  assert.deepEqual(app.paths, ['/token']);
+});
+
+test('completed Team callback replaces an expired JSON before trying its invalid old RT', async (t) => {
+  const workspaceId = 'fixture-team-workspace';
+  const child = { id: 'team-callback-before-refresh', email: 'team-callback-before-refresh@example.test',
+    chatgptUserId: 'team-callback-before-refresh', team: workspaceId,
+    workspaceHistory: [{ team: workspaceId, status: 'active', role: 'standard-user' }],
+    workspaceTokens: { [workspaceId]: { accessToken: token('team-callback-before-refresh@example.test', 'team-callback-before-refresh', { workspaceId, plan: 'team', expiresIn: -60 }).access_token, refreshToken: 'private-invalid-old-team-rt' } },
+    teamAuthSessions: { [workspaceId]: { state: 'private-completed-team-state', codeVerifier: 'private-completed-team-verifier',
+      callbackReceivedAt: new Date().toISOString(), callbackUrl: 'http://localhost:1455/auth/callback?code=private-completed-team-code&state=private-completed-team-state' } },
+    teamLoginStates: { [workspaceId]: { workspaceId, status: 'browser_verification_required', code: 'browser_verification_required', needsInput: true, browserRequired: true } },
+  };
+  const credentials = token(child.email, child.chatgptUserId, { workspaceId, plan: 'team' });
+  const app = await appFixture(t, [child], { mothers: [teamOwner()], roxyEnabled: true,
+    responses: { 'private-completed-team-code': credentials },
+    teamScenario: { members: [ownerMember(), { id: child.id, email: child.email, role: 'standard-user', seat_type: 'default' }] },
+  });
+  const job = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother', ids: [child.id] })).job.id);
+  assert.equal(job.succeeded, 1);
+  assert.equal(job.results[0].id, child.id);
+  assert.equal(job.results[0].quotaChecked, true);
+  assert.deepEqual(app.grants, [{ key: 'private-completed-team-code', type: 'authorization_code', verifier: 'private-completed-team-verifier' }]);
+  assert.ok(app.paths.includes(`/backend-api/accounts/${workspaceId}/users`));
+  assert.ok(!app.paths.some((pathname) => pathname === '/oauth/authorize' || pathname.startsWith('/api/accounts/')));
+  assert.ok(!job.logs.some((entry) => /重复浏览器登录|正在启动独立浏览器|正在打开账号绑定/.test(entry.message)));
+  const saved = (await app.saved()).children[0];
+  assert.equal(saved.workspaceTokens[workspaceId].accessToken, credentials.access_token);
+  assert.equal(saved.workspaceTokens[workspaceId].refreshToken, credentials.refresh_token);
+  assert.equal(saved.teamAuthSessions[workspaceId], undefined);
+  assert.doesNotMatch(JSON.stringify(job), /private-completed-team-code|private-completed-team-verifier|private-invalid-old-team-rt/);
+});
+
+test('Team RT failure or a wrong refreshed token preserves prior JSON and never opens a browser', async (t) => {
+  const workspaceId = 'fixture-team-workspace';
+  for (const scenario of [
+    { name: 'invalid-grant' },
+    { name: 'upstream-unavailable', tokenStatus: 503 },
+    { name: 'wrong-email', email: 'foreign@example.test' },
+    { name: 'wrong-subject', subject: 'foreign-user' },
+    { name: 'wrong-workspace', workspaceId: 'foreign-workspace' },
+    { name: 'wrong-plan', plan: 'free' },
+    { name: 'expired-response', expiresIn: -60 },
+  ]) await t.test(scenario.name, async (subtest) => {
+    const child = { id: 'expired-invalid-refresh', email: 'expired-invalid-refresh@example.test', password: 'private-unused-login-password',
+      chatgptUserId: 'expired-invalid-refresh', team: workspaceId, workspaceHistory: [{ team: workspaceId, status: 'active' }],
+      workspaceTokens: { [workspaceId]: { accessToken: token('expired-invalid-refresh@example.test', 'expired-invalid-refresh', { workspaceId, plan: 'team', expiresIn: -60 }).access_token, refreshToken: 'private-original-team-rt' } },
+    };
+    const response = scenario.name === 'invalid-grant' ? null : token(scenario.email || child.email, scenario.subject || child.chatgptUserId,
+      { workspaceId: scenario.workspaceId || workspaceId, plan: scenario.plan || 'team', expiresIn: scenario.expiresIn ?? 3600 });
+    const app = await appFixture(subtest, [child], { credentialChild: child, mothers: [teamOwner()], roxyEnabled: true,
+      responses: { 'private-original-team-rt': response }, tokenStatuses: { 'private-original-team-rt': scenario.tokenStatus } });
+    const job = await app.finish((await app.start({ scope: 'team', motherId: 'fixture-mother', ids: [child.id] })).job.id);
+    assert.equal(job.succeeded, 0);
+    assert.equal(job.failed, 1);
+    assert.ok(['team_token_refresh_failed', 'team_token_changed', 'token_identity_mismatch', 'team_workspace_mismatch'].includes(job.results[0].code), job.results[0].code);
+    assert.deepEqual(app.paths, ['/token']);
+    assert.equal(app.grants[0].type, 'refresh_token');
+    assert.deepEqual((await app.saved()).children[0].workspaceTokens, child.workspaceTokens);
+    assert.doesNotMatch(JSON.stringify(job), /private-original-team-rt|private-fixture-new-rt|private-fixture-signature|upstream-private-message/);
+  });
 });
 
 test('serial Team batch settles failures once, continues to the next account and explicitly retries only selected failures', async (t) => {

@@ -880,7 +880,7 @@ for (const status of [408, 429, 503]) {
 
 test('a completed Sub2API browser authorization is consumed on the next Free JSON click instead of creating another link', async (t) => {
   const id = 'provider-callback-after-link-child';
-  const email = 'callback-user@example.test';
+  const email = 'halortappiahs@example.test';
   const state = 'provider-callback-after-link-state';
   const code = 'provider-callback-after-link-code';
   const sessionId = 'provider-callback-after-link-session';

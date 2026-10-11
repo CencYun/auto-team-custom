@@ -33,12 +33,12 @@ function recordFields(input, previous) {
 
 export function publicMailboxVaultRecord(record) {
   return { id: record.id, account: record.account, hasPassword: Boolean(record.password), hasTotp: Boolean(record.totp),
-    createdAt: record.createdAt, updatedAt: record.updatedAt };
+    createdAt: record.createdAt, updatedAt: record.updatedAt, exportedAt: record.exportedAt ?? null };
 }
 
 export function fullMailboxVaultRecord(record) {
   return { id: record.id, ...Object.fromEntries(fields.map((field) => [field, record[field]])),
-    createdAt: record.createdAt, updatedAt: record.updatedAt };
+    createdAt: record.createdAt, updatedAt: record.updatedAt, exportedAt: record.exportedAt ?? null };
 }
 
 export function createMailboxVaultRecord(input, records, timestamp = new Date().toISOString()) {
@@ -46,7 +46,7 @@ export function createMailboxVaultRecord(input, records, timestamp = new Date().
   if (records.some((record) => accountKey(record.account) === accountKey(values.account))) {
     throw new MailboxVaultError(409, 'mailbox_vault_duplicate', '此邮箱已保存，请编辑已有记录');
   }
-  return { id: `mailbox_vault_${randomUUID()}`, ...values, createdAt: timestamp, updatedAt: timestamp };
+  return { id: `mailbox_vault_${randomUUID()}`, ...values, createdAt: timestamp, updatedAt: timestamp, exportedAt: null };
 }
 
 export function updateMailboxVaultRecord(previous, input, records, timestamp = new Date().toISOString()) {
@@ -54,7 +54,8 @@ export function updateMailboxVaultRecord(previous, input, records, timestamp = n
   if (records.some((record) => record.id !== previous.id && accountKey(record.account) === accountKey(values.account))) {
     throw new MailboxVaultError(409, 'mailbox_vault_duplicate', '此邮箱已保存，请编辑已有记录');
   }
-  return { ...fullMailboxVaultRecord(previous), ...values, updatedAt: timestamp };
+  return { ...fullMailboxVaultRecord(previous), ...values, updatedAt: timestamp,
+    exportedAt: accountKey(previous.account) === accountKey(values.account) ? previous.exportedAt ?? null : null };
 }
 
 function importRows(input) {
@@ -102,7 +103,7 @@ export function importMailboxVaultRecords(input, existing, timestamp = new Date(
     const key = accountKey(value.account);
     if (seen.has(key)) { skipped += 1; continue; }
     seen.add(key);
-    added.push({ id: `mailbox_vault_${randomUUID()}`, ...value, createdAt: timestamp, updatedAt: timestamp });
+    added.push({ id: `mailbox_vault_${randomUUID()}`, ...value, createdAt: timestamp, updatedAt: timestamp, exportedAt: null });
   }
   return { added, skipped };
 }
@@ -119,4 +120,17 @@ export function selectMailboxVaultRecords(records, ids) {
 export function exportMailboxVaultRecords(records, ids, timestamp = new Date().toISOString()) {
   return { format: MAILBOX_VAULT_FORMAT, version: 1, exportedAt: timestamp,
     records: selectMailboxVaultRecords(records, ids).map(fullMailboxVaultRecord) };
+}
+
+export function markMailboxVaultRecordsExported(records, selection, timestamp = new Date().toISOString()) {
+  if (!Array.isArray(selection) || !selection.length || selection.some((item) => !item || typeof item !== 'object'
+    || Array.isArray(item) || typeof item.account !== 'string' || item.account.length > limits.account
+    || !isMailboxAccount(item.account.trim()))) {
+    throw new MailboxVaultError(400, 'mailbox_vault_selection_required', '请提供本次导出的邮箱记录');
+  }
+  const selected = selectMailboxVaultRecords(records, selection.map((item) => item.id));
+  if (selected.some((record, index) => accountKey(record.account) !== accountKey(selection[index].account))) {
+    throw new MailboxVaultError(409, 'mailbox_vault_selection_stale', '部分邮箱已修改，请刷新列表后重新导出');
+  }
+  return selected.map((record) => ({ ...fullMailboxVaultRecord(record), exportedAt: timestamp, updatedAt: timestamp }));
 }

@@ -160,6 +160,7 @@ test('every mailbox route enforces existing authentication, origin checks and fr
     ['/api/mailbox-vault', 'POST', { account: 'x@example.test' }], [`/api/mailbox-vault/${id}`, 'PATCH', { password: 'x' }],
     ['/api/mailbox-vault/import', 'POST', { text: 'x@example.test----p----t' }],
     ['/api/mailbox-vault/export', 'POST', { ids: [id] }],
+    ['/api/mailbox-vault/mark-exported', 'POST', { records: [{ id, account: created.data.record.account }] }],
     ['/api/mailbox-vault/batch-delete', 'POST', { ids: [id] }], [`/api/mailbox-vault/${id}`, 'DELETE'],
   ];
   const saved = await app.saved();
@@ -169,4 +170,71 @@ test('every mailbox route enforces existing authentication, origin checks and fr
   }
   assert.equal(await app.saved(), saved);
   assert.equal((await app.request('/api/mailbox-vault/missing')).status, 404);
+});
+
+test('mailbox export marking is explicit, atomic, persistent and permits exporting used emails again', async (t) => {
+  const app = await fixture(t);
+  const imported = await app.request('/api/mailbox-vault/import', { method: 'POST', body: { records: [
+    { account: 'a@example.test', password: 'a----secret', totp: 'first-2fa', exportedAt: 'forged' },
+    { account: 'b@example.test', password: ' b,secret ', totp: 'second-2fa' },
+    { account: 'c@example.test', password: 'c-secret', totp: '' },
+  ] } });
+  assert.equal(imported.status, 200);
+  const [a, b, c] = imported.data.records;
+  assert.ok(imported.data.records.every((record) => record.exportedAt === null));
+  const saved = await app.saved();
+  const before = await app.decoded();
+  const exported = await app.request('/api/mailbox-vault/export', { method: 'POST', body: { ids: [b.id, a.id] } });
+  assert.equal(exported.status, 200);
+  assert.ok(exported.data.records.every((record) => record.exportedAt === null));
+  assert.ok((await app.request('/api/mailbox-vault')).data.records.every((record) => record.exportedAt === null));
+  assert.equal((await app.request(`/api/mailbox-vault/${a.id}`)).data.record.exportedAt, null);
+  assert.equal(await app.saved(), saved, 'loading list, credentials and export never mark mailboxes');
+  for (const records of [undefined, [], [null], [{ id: a.id }], [{ id: a.id, account: 123 }],
+    [{ id: a.id, account: a.account }, { id: a.id, account: a.account }]]) {
+    assert.equal((await app.request('/api/mailbox-vault/mark-exported', { method: 'POST', body: { records } })).status, 400);
+  }
+  for (const records of [
+    [{ id: a.id, account: a.account }, { id: b.id, account: 'old@example.test' }],
+    [{ id: a.id, account: a.account }, { id: 'missing', account: b.account }],
+  ]) assert.equal((await app.request('/api/mailbox-vault/mark-exported', { method: 'POST', body: { records } })).status, 409);
+  assert.equal(await app.saved(), saved, 'invalid selections do not partially mark records');
+  const marked = await app.request('/api/mailbox-vault/mark-exported', { method: 'POST', body: {
+    records: [{ id: b.id, account: 'B@EXAMPLE.TEST' }, { id: a.id, account: a.account }],
+  } });
+  assert.equal(marked.status, 200);
+  assert.deepEqual(marked.data.records.map((record) => record.id), [b.id, a.id]);
+  assert.ok(marked.data.records.every((record) => Number.isFinite(Date.parse(record.exportedAt))));
+  assert.ok(marked.data.records.every((record) => !('password' in record) && !('totp' in record)));
+  const stamp = marked.data.records[0].exportedAt;
+  const listed = (await app.request('/api/mailbox-vault')).data.records;
+  assert.equal(listed.find((record) => record.id === c.id).exportedAt, null);
+  assert.equal(listed.find((record) => record.id === a.id).exportedAt, stamp);
+  assert.equal(JSON.parse(await app.saved()).encrypted, true);
+  const decoded = await app.decoded();
+  for (const field of ['mothers', 'motherVault', 'children', 'history', 'settings']) assert.deepEqual(decoded[field], before[field]);
+  await app.restart();
+  assert.deepEqual((await app.request('/api/mailbox-vault')).data.records, listed);
+  assert.equal((await app.request(`/api/mailbox-vault/${a.id}`)).data.record.exportedAt, stamp);
+  const repeated = await app.request('/api/mailbox-vault/export', { method: 'POST', body: { ids: [b.id, a.id] } });
+  assert.equal(repeated.status, 200);
+  assert.equal(repeated.data.records[0].exportedAt, stamp);
+  assert.equal(exportMailboxVaultText(repeated.data.records), exportMailboxVaultText(exported.data.records));
+  assert.equal((await app.request('/api/mailbox-vault/mark-exported', { method: 'POST', body: {
+    records: repeated.data.records.map(({ id, account }) => ({ id, account })),
+  } })).status, 200);
+  const bStamp = (await app.request(`/api/mailbox-vault/${b.id}`)).data.record.exportedAt;
+  const edited = await app.request(`/api/mailbox-vault/${b.id}`, { method: 'PATCH', body: {
+    account: 'B@example.test', password: 'new-password', totp: 'new-2fa', exportedAt: null,
+  } });
+  assert.equal(edited.status, 200);
+  assert.equal(edited.data.record.exportedAt, bStamp);
+  const changed = await app.request(`/api/mailbox-vault/${b.id}`, { method: 'PATCH', body: { account: 'changed@example.test', exportedAt: bStamp } });
+  assert.equal(changed.data.record.exportedAt, null);
+  const afterEdit = await app.saved();
+  assert.equal((await app.request('/api/mailbox-vault/mark-exported', { method: 'POST', body: {
+    records: [{ id: a.id, account: a.account }, { id: b.id, account: b.account }],
+  } })).status, 409);
+  assert.equal(await app.saved(), afterEdit);
+  assert.doesNotMatch(app.output(), /UNEXPECTED_MAILBOX_NETWORK_REQUEST|a----secret|new-password/);
 });

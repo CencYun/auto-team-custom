@@ -21,12 +21,12 @@ import { automaticRotationTeams, normalizeTeamRotationEnabled } from './team-rot
 import { currentSeatQuantity, normalizeBillingPreview } from './billing-preview.mjs';
 import { clearQuotaKickDelay, normalizeDelayedKickMinutes, quotaKickDelayDue, updateQuotaKickDelay } from './quota-kick-delay.mjs';
 import { createDashboardAuth } from './dashboard-auth.mjs';
-import { DEFAULT_ROXY_CONFIG, RoxyBrowserError, createRoxyApiClient, normalizeRoxyConfig, openRoxyBrowserSession, publicRoxyConfig, resolveRoxyAccountProfile, roxyProxyInfo } from './roxy-browser.mjs';
+import { DEFAULT_ROXY_CONFIG, RoxyBrowserError, createRoxyApiClient, deleteClosedRoxyProfile, normalizeRoxyConfig, openRoxyBrowserSession, publicRoxyConfig, resolveRoxyAccountProfile, resolveRoxyPoolProfile, roxyProxyInfo } from './roxy-browser.mjs';
 import { completeBrowserOAuth } from './openai-browser-login.mjs';
 import { buildAccountExportCandidates, selectAccountExports } from './account-exports.mjs';
 import { createConcurrencyQueue } from './concurrency-queue.mjs';
 import { MotherVaultError, createMotherVaultRecord, exportMotherVaultRecords, fullMotherVaultRecord, importMotherVaultRecords, publicMotherVaultRecord, selectMotherVaultRecords, updateMotherVaultRecord } from './mother-vault.mjs';
-import { MailboxVaultError, createMailboxVaultRecord, exportMailboxVaultRecords, fullMailboxVaultRecord, importMailboxVaultRecords, publicMailboxVaultRecord, selectMailboxVaultRecords, updateMailboxVaultRecord } from './mailbox-vault.mjs';
+import { MailboxVaultError, createMailboxVaultRecord, exportMailboxVaultRecords, fullMailboxVaultRecord, importMailboxVaultRecords, markMailboxVaultRecordsExported, publicMailboxVaultRecord, selectMailboxVaultRecords, updateMailboxVaultRecord } from './mailbox-vault.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dataDir = path.resolve(process.env.TEAM_ROTATION_DATA_DIR || path.join(root, 'data'));
@@ -1022,16 +1022,17 @@ function saveTeamInvitation(child, mother, fields = {}) {
   return entry;
 }
 
-function completeTeamJsonFor(child, mother) {
+function completeTeamJsonFor(child, mother, { allowExpired = false } = {}) {
   const workspaceId = configuredTeamId(mother);
   const record = child?.workspaceTokens?.[workspaceId];
-  const details = teamTokenDetails(record?.accessToken, workspaceId);
-  const plan = String(details?.claims?.planType || record?.planType || '').toLowerCase();
-  const expiresAt = Date.parse(details?.claims?.expiresAt || '');
-  const identityKnown = Boolean(details?.claims?.userId && child?.chatgptUserId === details.claims.userId)
-    || Boolean(details?.claims?.email && workspaceIdKey(details.claims.email) === workspaceIdKey(child?.email));
-  return record?.refreshToken && details && ['team', 'business', 'self_serve_business_prolite'].includes(plan)
-    && identityKnown && Number.isFinite(expiresAt) && expiresAt > Date.now() + 30_000 && childTokenIdentityMatches(child, record.accessToken) ? record : null;
+  const claims = accessTokenClaims(record?.accessToken);
+  const plan = String(claims.planType || record?.planType || '').toLowerCase();
+  const expiresAt = Date.parse(claims.expiresAt || '');
+  const identityKnown = Boolean(claims.userId && child?.chatgptUserId === claims.userId)
+    || Boolean(claims.email && workspaceIdKey(claims.email) === workspaceIdKey(child?.email));
+  return record?.refreshToken && workspaceId && claims.accountId === workspaceId && ['team', 'business', 'self_serve_business_prolite'].includes(plan)
+    && identityKnown && Number.isFinite(expiresAt) && (allowExpired || expiresAt > Date.now() + 30_000)
+    && childTokenIdentityMatches(child, record.accessToken) ? record : null;
 }
 
 function publicChild(child, teamId = null) {
@@ -2942,6 +2943,14 @@ function childKickTarget(childId, body = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { failure: fail(400, 'team_kick_scope_required') };
   const child = findChild(childId);
   if (!child) return { failure: fail(404, 'child_not_found') };
+  if (Object.hasOwn(body, 'expectedEmail')) {
+    if (typeof body.expectedEmail !== 'string' || !body.expectedEmail.trim()) {
+      return { failure: fail(400, 'team_kick_identity_required') };
+    }
+    if (workspaceIdKey(body.expectedEmail) !== workspaceIdKey(child.email)) {
+      return { failure: fail(409, 'child_identity_changed_before_kick') };
+    }
+  }
   const explicit = Object.hasOwn(body || {}, 'motherId') || Object.hasOwn(body || {}, 'workspaceId');
   if (explicit && (typeof body.motherId !== 'string' || !body.motherId.trim()
     || typeof body.workspaceId !== 'string' || !body.workspaceId.trim())) {
@@ -3859,11 +3868,26 @@ const childAuthQueues = new Map();
 const childTeamAuthOperations = new Map();
 let roxyProfileProvisioning = Promise.resolve();
 const autoJsonExecution = new AsyncLocalStorage();
-const roxyBrowserQueue = createConcurrencyQueue(() => state.settings.integrations?.roxy?.concurrency || 1);
+const roxyExecution = new AsyncLocalStorage();
+// Only locally produced cleanup metadata may survive an unexpected exception;
+// exception messages and arbitrary provider payloads remain private.
+const roxyAuthorizationFailureCleanup = new WeakMap();
+function roxyConcurrency(config = state.settings.integrations?.roxy) {
+  return Math.min(config?.concurrency || 1, config?.profileMode === 'pooled' ? config.poolSize || 3 : 3);
+}
+const roxyBrowserQueue = createConcurrencyQueue(() => roxyConcurrency());
+const activeRoxyPoolSlots = new Set();
 const roxyCleanupBlocks = new Map();
+let roxyProfileCleanupJobs = 0;
+let roxyProfileCleanupFinished = Promise.resolve();
 
-async function verifyRoxyCleanup() {
+function runRoxyQueued(operation) {
+  return roxyExecution.getStore() ? operation() : roxyBrowserQueue.run(operation);
+}
+
+async function verifyRoxyCleanup(target = null) {
   for (const [key, { config, dirId }] of roxyCleanupBlocks) {
+    if (target && (target.dirId !== dirId || target.baseUrl !== config.baseUrl)) continue;
     try {
       const current = state.settings.integrations?.roxy;
       const connectionConfig = current?.baseUrl === config.baseUrl ? { ...config, apiKey: current.apiKey } : config;
@@ -3874,23 +3898,26 @@ async function verifyRoxyCleanup() {
   }
 }
 
-async function ensureChildRoxyProfile(child, onProgress) {
+async function ensureChildRoxyProfile(child, execution, onProgress) {
   // Share the provision/persist lock across Free and all Team authorization
   // paths. Different accounts must not overwrite each other's mappings.
   const pending = roxyProfileProvisioning.catch(() => {}).then(async () => {
     const current = state.settings.integrations?.roxy;
-    if (!current?.enabled || current.profiles.some((profile) => profile.childId === child.id)) return;
+    if (!current?.enabled) return;
     if (findChild(child.id) !== child) throw new RoxyBrowserError('roxy_profile_missing');
+    const bound = current.profiles.find((profile) => profile.childId === child.id);
     // Validate the proxy pool before consuming a Roxy environment slot.
     bindRoxyProxyProfiles({ ...structuredClone(current), profiles: [
-      ...structuredClone(current.profiles), { childId: child.id, dirId: 'pending_profile' },
+      ...structuredClone(current.profiles), ...(!bound ? [{ childId: child.id, dirId: 'pending_profile' }] : []),
     ] });
-    onProgress('roxy_profile_preparing', '正在为该账号查找或创建独立 Roxy 窗口');
+    onProgress('roxy_profile_preparing', '正在核验账号绑定的 Roxy 环境，失效时重新分配');
     const { source, ...profile } = await resolveRoxyAccountProfile(current, child.id, { email: child.email });
+    if (source === 'created') execution.preparedProfile = { config: current, dirId: profile.dirId };
     if (findChild(child.id) !== child || state.settings.integrations.roxy !== current) {
       throw new RoxyBrowserError('roxy_profile_conflict');
     }
-    current.profiles.push(profile);
+    if (source === 'bound') return;
+    current.profiles = [...current.profiles.filter((entry) => entry.childId !== child.id), profile];
     // Preserve this binding even if proxy selection/login later fails. The
     // next attempt resumes the same environment instead of creating another.
     await persist();
@@ -3901,22 +3928,161 @@ async function ensureChildRoxyProfile(child, onProgress) {
   return pending;
 }
 
-async function runChildBrowserAuthorization(child, { browserLogin, callbackUrl, onProgress }, operation) {
+async function prepareRoxyPoolAccount(child, execution, onProgress) {
+  const pending = roxyProfileProvisioning.catch(() => {}).then(async () => {
+    const current = state.settings.integrations?.roxy;
+    if (findChild(child.id) !== child || current?.profileMode !== 'pooled') throw new RoxyBrowserError('roxy_profile_missing');
+    bindRoxyProxyProfiles(structuredClone(current));
+    if (current.useProxyPool) {
+      const entries = state.settings.proxy.entries.filter((entry) => entry?.url && entry.enabled !== false);
+      const existing = child.roxyProxyId || current.profiles.find((profile) => profile.childId === child.id)?.proxyId;
+      const selected = entries.find((entry) => entry.id === existing) || entries.reduce((best, entry) => {
+        const count = (id) => state.children.filter((item) => item.roxyProxyId === id).length;
+        return count(entry.id) < count(best.id) ? entry : best;
+      }, entries[0]);
+      if (!selected) throw new RoxyBrowserError('roxy_proxy_missing');
+      roxyProxyInfo(selected);
+      child.roxyProxyId = selected.id;
+    }
+    const slots = Array.from({ length: current.poolSize || 3 }, (_, index) => index)
+      .filter((index) => !activeRoxyPoolSlots.has(index));
+    onProgress('roxy_pool_preparing', '正在分配空闲 Roxy 环境');
+    let resolved;
+    for (const slot of slots) {
+      activeRoxyPoolSlots.add(slot);
+      execution.slot = slot;
+      try {
+        resolved = await resolveRoxyPoolProfile(current, slot);
+        execution.preparedProfile = { config: current, dirId: resolved.dirId };
+        break;
+      } catch (error) {
+        activeRoxyPoolSlots.delete(slot);
+        delete execution.slot;
+        // A user-opened environment must not block another idle pool slot,
+        // or cause the tool to create an extra environment beyond its limit.
+        if (error?.code !== 'roxy_profile_busy') throw error;
+      }
+    }
+    if (!resolved) throw new RoxyBrowserError('roxy_profile_busy');
+    if (findChild(child.id) !== child || state.settings.integrations.roxy !== current) throw new RoxyBrowserError('roxy_profile_conflict');
+    const slot = execution.slot;
+    current.poolProfiles = [...(current.poolProfiles || []).filter((entry) => entry.slot !== slot && entry.dirId !== resolved.dirId), { slot, dirId: resolved.dirId }];
+    execution.profile = { dirId: resolved.dirId, ...(child.roxyProxyId ? { proxyId: child.roxyProxyId } : {}) };
+    await persist();
+    onProgress('roxy_pool_acquired', '已分配空闲环境，本次账号使用隔离登录会话');
+  });
+  roxyProfileProvisioning = pending;
+  return pending;
+}
+
+async function releaseSavedRoxyProfile(child, config, dirId, onProgress = () => {}, { failed = false } = {}) {
+  const pending = roxyProfileProvisioning.catch(() => {}).then(async () => {
+    const current = state.settings.integrations?.roxy;
+    if (current !== config || findChild(child.id) !== child) throw new RoxyBrowserError('roxy_profile_conflict');
+    // One failed close still blocks new browser starts, but must not prevent
+    // another independently closed account from releasing its saved slot.
+    await verifyRoxyCleanup({ baseUrl: config.baseUrl, dirId });
+    onProgress(failed ? 'roxy_failed_profile_deleting' : 'roxy_profile_deleting', failed
+      ? '本次授权失败，正在确认窗口关闭并释放 Roxy 环境名额' : 'JSON 已保存，正在关闭并释放 Roxy 环境名额');
+    const result = await deleteClosedRoxyProfile(config, dirId);
+    // The proxy remains attached to the account for quota/RT requests after
+    // its browser environment has moved to the recoverable recycle bin.
+    for (const binding of current.profiles.filter((entry) => entry.dirId === dirId)) {
+      const account = findChild(binding.childId);
+      if (account && binding.proxyId && (current.profileMode !== 'pooled' || !account.roxyProxyId)) account.roxyProxyId = binding.proxyId;
+    }
+    current.profiles = current.profiles.filter((entry) => entry.dirId !== dirId);
+    current.poolProfiles = (current.poolProfiles || []).filter((entry) => entry.dirId !== dirId);
+    addHistory('释放 Roxy 环境', failed
+      ? `${child.email} 本次授权失败，授权环境已移入 Roxy 回收站，可在运行日志中重试`
+      : `${child.email} 的授权 JSON 已保留，授权环境已移入 Roxy 回收站`);
+    await persist();
+    onProgress(failed ? 'roxy_failed_profile_deleted' : 'roxy_profile_deleted', failed
+      ? '失败环境已移入 Roxy 回收站，窗口用量已释放，可在运行日志中重试'
+      : '授权环境已移入 Roxy 回收站，窗口用量已释放，本机 JSON 保留');
+    return { deleted: result.deleted, released: true };
+  });
+  roxyProfileProvisioning = pending;
+  return pending;
+}
+
+async function runChildBrowserAuthorization(child, { browserLogin, callbackUrl, onProgress }, operation, finalizeLogin = (result) => result) {
   try {
     // Called only after cached AT/RT paths and credential checks. A completed
     // manual callback never needs a Roxy window or consumes an environment slot.
     if (browserLogin && !callbackUrl && state.settings.integrations?.roxy?.enabled && findChild(child.id) === child) {
-      await ensureChildRoxyProfile(child, onProgress);
+      onProgress('roxy_queued', '等待空闲 Roxy 窗口，前一个窗口释放后继续');
+      // Historical cleanup holds several consecutive profile deletions. A
+      // newly queued login must not lease a profile between those deletions.
+      if (roxyProfileCleanupJobs) await roxyProfileCleanupFinished;
+      return await runRoxyQueued(() => roxyExecution.run({}, async () => {
+        const execution = roxyExecution.getStore();
+        let result;
+        let failureError;
+        try {
+          try {
+            await verifyRoxyCleanup();
+            if (state.settings.integrations.roxy.profileMode === 'pooled') await prepareRoxyPoolAccount(child, execution, onProgress);
+            else await ensureChildRoxyProfile(child, execution, onProgress);
+            result = await withChildAuthorizationNetwork(child, browserLogin, async () =>
+              finalizeLogin(await operation(automaticBrowserOptions(child, browserLogin))));
+          } catch (error) {
+            if (!(error instanceof RoxyBrowserError)) throw error;
+            result = await finalizeLogin({ ok: false, status: error.status, code: error.code, message: error.message, browserRequired: true, needsInput: true });
+          }
+          return result;
+        } catch (error) {
+          failureError = error;
+          throw error;
+        } finally {
+          try {
+            const owned = execution.openedProfile || execution.preparedProfile;
+            const token = result?.tokenScope === 'team' ? workspaceTokenFor(child, result.accountId) : child;
+            // The account wrapper later reports incomplete credentials as
+            // json_incomplete even if the OAuth exchange itself returned ok.
+            const failed = result?.ok !== true || result.exportable && (!token?.accessToken || !token?.refreshToken);
+            const releaseSuccess = !failed && result.exportable && token?.accessToken && token?.refreshToken
+              && execution.openedProfile?.config.deleteProfileAfterSuccess === true;
+            if (releaseSuccess || failed && owned?.config.deleteProfileAfterFailure === true) {
+              let cleanup;
+              try { cleanup = await releaseSavedRoxyProfile(child, owned.config, owned.dirId, onProgress, { failed }); }
+              catch {
+                // Cleanup is secondary: keep the saved JSON or original
+                // authorization failure, never rerun OAuth or invent release.
+                cleanup = { deleted: false, released: false, code: 'roxy_profile_delete_failed' };
+                onProgress(failed ? 'roxy_failed_profile_delete_failed' : 'roxy_profile_delete_failed', failed
+                  ? '授权失败且环境名额未释放，请检查 Roxy 窗口状态后再重试'
+                  : 'JSON 已保存，但环境名额未释放，请检查 Roxy 回收站或重试清理');
+                addHistory('释放 Roxy 环境', failed
+                  ? `${child.email} 本次授权失败，且 Roxy 环境名额未能释放`
+                  : `${child.email} 的 JSON 已保存，但 Roxy 环境名额未能释放`, 'partial');
+                await persist().catch(() => {});
+              }
+              if (result) result.roxyCleanup = cleanup;
+              else if (failureError && typeof failureError === 'object') roxyAuthorizationFailureCleanup.set(failureError, cleanup);
+            }
+          } finally {
+            if (execution.slot !== undefined) activeRoxyPoolSlots.delete(execution.slot);
+          }
+        }
+      }));
     }
-    return await withChildAuthorizationNetwork(child, browserLogin, () => operation(automaticBrowserOptions(child, browserLogin)));
+    return await withChildAuthorizationNetwork(child, browserLogin, async () => finalizeLogin(await operation(automaticBrowserOptions(child, browserLogin))));
   } catch (error) {
     if (!(error instanceof RoxyBrowserError)) throw error;
-    return { ok: false, status: error.status, code: error.code, message: error.message, browserRequired: true, needsInput: true };
+    return finalizeLogin({ ok: false, status: error.status, code: error.code, message: error.message, browserRequired: true, needsInput: true });
   }
 }
 
 function bindRoxyProxyProfiles(config, proxy = state.settings.proxy) {
-  const entries = Array.isArray(proxy?.entries) ? proxy.entries.filter((entry) => entry?.url) : [];
+  const entries = Array.isArray(proxy?.entries) ? proxy.entries.filter((entry) => entry?.url && entry.enabled !== false) : [];
+  if (config.profileMode === 'pooled') {
+    if (config.enabled && config.useProxyPool) {
+      if (!proxy?.enabled) throw new RoxyBrowserError('roxy_proxy_pool_disabled', { status: 400 });
+      if (!entries.length) throw new RoxyBrowserError('roxy_proxy_missing', { status: 400 });
+    }
+    return config;
+  }
   if (config.profiles.some((profile) => profile.proxyId && !entries.some((entry) => entry.id === profile.proxyId))) {
     throw new RoxyBrowserError('roxy_proxy_missing', { status: 400 });
   }
@@ -3929,7 +4095,8 @@ function bindRoxyProxyProfiles(config, proxy = state.settings.proxy) {
       roxyProxyInfo(entries.find((entry) => entry.id === profile.proxyId));
       continue;
     }
-    const selected = entries.reduce((best, entry) => counts.get(entry.id) < counts.get(best.id) ? entry : best, entries[0]);
+    const retained = entries.find((entry) => entry.id === findChild(profile.childId)?.roxyProxyId);
+    const selected = retained || entries.reduce((best, entry) => counts.get(entry.id) < counts.get(best.id) ? entry : best, entries[0]);
     roxyProxyInfo(selected);
     profile.proxyId = selected.id;
     counts.set(selected.id, counts.get(selected.id) + 1);
@@ -3941,7 +4108,9 @@ async function withChildAuthorizationNetwork(child, browserLogin, operation) {
   const current = state.settings.integrations?.roxy;
   if (authorizationNetwork.getStore()?.childId === child.id) return operation();
   if (browserLogin === false || !current?.enabled || !current.useProxyPool) return operation();
-  const profile = current.profiles.find((entry) => entry.childId === child.id);
+  const pooled = current.profileMode === 'pooled';
+  const profile = pooled ? roxyExecution.getStore()?.profile || (child.roxyProxyId ? { proxyId: child.roxyProxyId } : null)
+    : current.profiles.find((entry) => entry.childId === child.id) || (child.roxyProxyId ? { proxyId: child.roxyProxyId } : null);
   // Cached credentials/callbacks remain usable without a browser mapping.
   // A new profile is provisioned only when browser login is actually needed.
   if (!profile) return operation();
@@ -3949,7 +4118,8 @@ async function withChildAuthorizationNetwork(child, browserLogin, operation) {
   let config;
   try {
     config = bindRoxyProxyProfiles(structuredClone(current));
-    proxyEntry = structuredClone(state.settings.proxy.entries.find((entry) => entry.id === config.profiles.find((entry) => entry.childId === child.id).proxyId));
+    proxyEntry = structuredClone(state.settings.proxy.entries.find((entry) => entry.id === (pooled ? child.roxyProxyId : config.profiles.find((entry) => entry.childId === child.id)?.proxyId || child.roxyProxyId)));
+    if (!proxyEntry || proxyEntry.enabled === false) throw new RoxyBrowserError('roxy_proxy_missing');
   } catch (error) {
     const safe = error instanceof RoxyBrowserError ? error : new RoxyBrowserError('roxy_proxy_missing');
     return { ok: false, status: safe.status, code: safe.code, message: safe.message, needsInput: true, child: publicChild(child) };
@@ -3957,27 +4127,62 @@ async function withChildAuthorizationNetwork(child, browserLogin, operation) {
   const proxySettings = { ...structuredClone(state.settings.proxy), enabled: true,
     strategy: 'failover', maxRetries: 0, entries: [proxyEntry] };
   // Reserve before awaiting persistence so deletion cannot race startup.
-  activeAuthorizationProxies.set(proxyEntry.id, (activeAuthorizationProxies.get(proxyEntry.id) || 0) + 1);
+  const network = { childId: child.id, config, proxyEntry, proxySettings, reservedProxyIds: new Set() };
+  reserveAuthorizationProxy(network, proxyEntry.id);
   try {
     if (!profile.proxyId) {
       profile.proxyId = proxyEntry.id;
       await persist();
     }
-    return await authorizationNetwork.run({ childId: child.id, config, proxyEntry, proxySettings }, operation);
+    return await authorizationNetwork.run(network, operation);
   } finally {
-    const remaining = activeAuthorizationProxies.get(proxyEntry.id) - 1;
-    if (remaining) activeAuthorizationProxies.set(proxyEntry.id, remaining);
-    else activeAuthorizationProxies.delete(proxyEntry.id);
+    for (const id of network.reservedProxyIds) {
+      const remaining = activeAuthorizationProxies.get(id) - 1;
+      if (remaining > 0) activeAuthorizationProxies.set(id, remaining);
+      else activeAuthorizationProxies.delete(id);
+    }
   }
+}
+
+function reserveAuthorizationProxy(network, id) {
+  if (network.reservedProxyIds.has(id)) return;
+  network.reservedProxyIds.add(id);
+  activeAuthorizationProxies.set(id, (activeAuthorizationProxies.get(id) || 0) + 1);
+}
+
+async function switchRoxyAuthorizationProxy(child, network, attempted) {
+  const current = state.settings.integrations?.roxy;
+  if (network?.childId !== child.id || !current?.enabled || !current.useProxyPool
+    || !state.settings.proxy.enabled || findChild(child.id) !== child || attempted.size >= 3) return false;
+  const entries = state.settings.proxy.entries.filter((entry) => entry?.url && entry.enabled !== false);
+  const index = entries.findIndex((entry) => entry.id === network.proxyEntry.id);
+  const ordered = [...entries.slice(index + 1), ...entries.slice(0, index + 1)];
+  const selected = ordered.find((entry) => !attempted.has(entry.id));
+  if (!selected) return false;
+  roxyProxyInfo(selected);
+  const pooled = current.profileMode === 'pooled';
+  const profile = pooled ? roxyExecution.getStore()?.profile : current.profiles.find((entry) => entry.childId === child.id);
+  if (!profile) throw new RoxyBrowserError('roxy_profile_missing');
+  reserveAuthorizationProxy(network, selected.id);
+  profile.proxyId = selected.id;
+  child.roxyProxyId = selected.id;
+  // Mutate the existing per-account context: the OAuth code exchange and later
+  // requests in the outer authorization operation must use the winning route.
+  network.config = structuredClone(current);
+  network.proxyEntry = structuredClone(selected);
+  network.proxySettings = { ...structuredClone(state.settings.proxy), enabled: true,
+    strategy: 'failover', maxRetries: 0, entries: [network.proxyEntry] };
+  await persist();
+  return true;
 }
 
 function childLoginConfiguration(child) {
   const roxy = state.settings.integrations?.roxy;
   if (!roxy?.enabled) return 'protocol';
   const profile = roxy.profiles.find((entry) => entry.childId === child.id);
-  const proxy = roxy.useProxyPool ? state.settings.proxy?.entries?.find((entry) => entry.id === profile?.proxyId) : null;
+  const proxy = roxy.useProxyPool ? state.settings.proxy?.entries?.find((entry) => entry.id === (roxy.profileMode === 'pooled' ? child.roxyProxyId : profile?.proxyId || child.roxyProxyId)) : null;
   return createHash('sha256').update(JSON.stringify({ baseUrl: roxy.baseUrl, workspaceId: roxy.workspaceId,
-    dirId: profile?.dirId, headless: roxy.headless === true, useProxyPool: roxy.useProxyPool === true,
+    profileMode: roxy.profileMode || 'dedicated', dirId: roxy.profileMode === 'pooled' ? undefined : profile?.dirId, headless: roxy.headless === true, useProxyPool: roxy.useProxyPool === true,
     proxyId: proxy?.id, proxyUrl: proxy?.url,
     localProxyEnabled: state.settings.proxy?.localProxyEnabled === true,
     localProxyUrl: state.settings.proxy?.localProxyEnabled ? state.settings.proxy.localProxyUrl : '',
@@ -4002,13 +4207,20 @@ function automaticBrowserOptions(child, browserLogin) {
   // Roxy, the original protocol login remains the default authorization path.
   if (!browserLogin || state.settings.integrations?.roxy?.enabled !== true) return { browserLogin: false, protocolOnly: true };
   const network = authorizationNetwork.getStore();
-  const config = network?.childId === child.id ? network.config : structuredClone(state.settings.integrations.roxy);
   return {
     browserLogin: true,
     protocolOnly: false,
-    browserOAuth: (options) => roxyBrowserQueue.run(async () => {
+    allowLocalAuthorizationFallback: true,
+    browserOAuth: (options) => runRoxyQueued(async () => {
+      const execution = autoJsonExecution.getStore() || roxyExecution.getStore() || {};
+      const attempted = execution.proxyAttempts ||= new Set();
+      const attempt = async () => {
+      const config = network?.childId === child.id ? { ...network.config,
+        ...(network.config.profileMode === 'pooled'
+          ? { poolProfiles: structuredClone(state.settings.integrations.roxy.poolProfiles || []) }
+          : { profiles: structuredClone(state.settings.integrations.roxy.profiles || []) }) }
+        : structuredClone(state.settings.integrations.roxy);
       await verifyRoxyCleanup();
-      const execution = autoJsonExecution.getStore();
       if (findChild(child.id) !== child || child.email !== options.email) {
         throw Object.assign(new Error('账号已变更，未启动浏览器'), { code: 'token_identity_mismatch', status: 409 });
       }
@@ -4026,9 +4238,15 @@ function automaticBrowserOptions(child, browserLogin) {
         ...options,
         acquireSession: ({ timeoutMs }) => {
           pendingAcquisition = (async () => {
-          const dirId = config.profiles.find((profile) => profile.childId === child.id)?.dirId;
+          const poolProfile = roxyExecution.getStore()?.profile;
+          const dirId = poolProfile?.dirId || config.profiles.find((profile) => profile.childId === child.id)?.dirId;
           let session;
           try { session = await openRoxyBrowserSession({ config, childId: child.id, timeoutMs,
+            ...(poolProfile ? { profile: poolProfile } : {}),
+            onProfileAcquired: (acquiredDirId) => {
+              const lease = roxyExecution.getStore();
+              if (lease) lease.preparedProfile = { config: state.settings.integrations.roxy, dirId: acquiredDirId };
+            },
             proxyEntry: network?.childId === child.id ? network.proxyEntry : null,
             localProxyUrl: network?.childId === child.id && network.proxySettings?.localProxyEnabled
               ? network.proxySettings.localProxyUrl : '' }); }
@@ -4036,7 +4254,10 @@ function automaticBrowserOptions(child, browserLogin) {
             if (dirId && error?.code === 'roxy_cleanup_failed') roxyCleanupBlocks.set(`${config.baseUrl}:${dirId}`, { config, dirId });
             throw error;
           }
-          const closeFailedWindow = autoJsonExecution.getStore()?.closeFailedWindow === true;
+          const lease = roxyExecution.getStore();
+          if (lease) lease.openedProfile = { config: state.settings.integrations.roxy, dirId };
+          const closeFailedWindow = config.deleteProfileAfterFailure === true || config.profileMode === 'pooled'
+            || config.useProxyPool || autoJsonExecution.getStore()?.closeFailedWindow === true;
           const owned = { ...session, keepOpenOnFailure: !closeFailedWindow && session.keepOpenOnFailure,
             close: (closeOptions) => pendingClose ||= (async () => {
               try { await session.close(closeFailedWindow || oauthFinished ? { keepOpen: false } : closeOptions); }
@@ -4056,6 +4277,29 @@ function automaticBrowserOptions(child, browserLogin) {
         // window. Retain the slot until that owned window is closed as well.
         await pendingAcquisition?.catch(() => {});
         await pendingClose?.catch(() => {});
+      }
+      };
+      for (;;) {
+        if (network?.childId === child.id && network.proxyEntry) {
+          attempted.add(network.proxyEntry.id);
+          options.onProgress?.('roxy_proxy_attempt', `正在使用第 ${attempted.size}/3 条代理授权，账号会话独立`);
+        }
+        try { return await attempt(); }
+        catch (error) {
+          // Retry only a diagnosed proxy/tunnel connection failure. Official
+          // rejection, credential errors and Roxy API failures keep their cause.
+          if (error?.code !== 'browser_oauth_proxy_connection_failed' || !network?.proxyEntry) throw error;
+          await verifyRoxyCleanup();
+          if (!await switchRoxyAuthorizationProxy(child, network, attempted)) {
+            options.onProgress?.('roxy_proxy_exhausted', `已尝试 ${attempted.size} 条代理，本账号停止重试；批量任务继续下一个账号`);
+            throw error;
+          }
+          if (options.workspaceMode === 'team') {
+            child.teamLoginConfigurations ||= {};
+            child.teamLoginConfigurations[options.workspaceId] = childLoginConfiguration(child);
+          } else child.loginConfiguration = childLoginConfiguration(child);
+          options.onProgress?.('roxy_proxy_switch', `代理连接失败，旧窗口已关闭，切换第 ${attempted.size + 1}/3 条代理`);
+        }
       }
     }),
   };
@@ -4167,7 +4411,7 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
   const activeOAuthAdapter = authSession?.state && authSession?.codeVerifier && !authSession?.authorization
     ? null
     : oauthAdapter;
-  const login = await runChildBrowserAuthorization(child, { browserLogin,
+  return runChildBrowserAuthorization(child, { browserLogin,
     callbackUrl: completedCallback || pendingOAuthCallback(authSession), onProgress }, async (browserOptions) => {
   if (!completedCallback) {
     child.loginBackend = browserOptions.browserLogin ? 'roxy' : 'protocol';
@@ -4195,7 +4439,7 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
     },
     ...(activeOAuthAdapter || {}),
   });
-  });
+  }, async (login) => {
   if (login.ok) {
     const needsPostSync = !login.sub2api && sub2apiConfig?.enabled === true;
     if (needsPostSync) {
@@ -4242,6 +4486,7 @@ async function acquireChildAuthInternal(child, { refresh = false, verificationCo
   addHistory('登录 Free 账号', `${child.email} ${message}`, 'partial');
   await persist();
   return { ok: false, status: login.status || 202, upstreamStatus: login.upstreamStatus || null, code: loginBanMessage ? 'account_banned' : login.code || (browserRequired ? 'verification_required' : 'login_failed'), message: loginBanMessage || message, banned: Boolean(loginBanMessage), stage: login.stage, browserRequired, needsInput: login.needsInput, authUrl: login.authUrl || null, child: publicChild(child) };
+  });
 }
 
 async function acquireTeamAuth(mother, child, options = {}) {
@@ -4315,7 +4560,7 @@ async function acquireTeamAuthInternal(mother, child, { verificationCode = '', c
   child.teamLoginStatus = 'authenticating';
   child.teamLoginMessage = completedCallback ? '正在处理已完成的 Team 浏览器授权' : `正在通过 OAuth 登录并选择 Team ${workspaceId}`;
   setTeamLoginState(child, workspaceId, { status: 'authenticating', message: child.teamLoginMessage });
-  const login = await runChildBrowserAuthorization(child, { browserLogin,
+  return runChildBrowserAuthorization(child, { browserLogin,
     callbackUrl: completedCallback || pendingOAuthCallback(compatibleSession), onProgress }, async (browserOptions) => {
   if (!completedCallback) {
     if (!child.teamLoginBackends || typeof child.teamLoginBackends !== 'object' || Array.isArray(child.teamLoginBackends)) child.teamLoginBackends = {};
@@ -4348,7 +4593,7 @@ async function acquireTeamAuthInternal(mother, child, { verificationCode = '', c
     },
     ...(activeOAuthAdapter || {}),
   });
-  });
+  }, async (login) => {
   // The browser intentionally runs outside the Team maintenance lock. Never
   // persist a callback against a deleted/replaced account or changed workspace.
   if (trackedMother && findMother(mother.id) !== mother || String(mother.accountId || '').trim() !== workspaceId) {
@@ -4478,6 +4723,7 @@ async function acquireTeamAuthInternal(mother, child, { verificationCode = '', c
   addHistory('生成 Team JSON', `${child.email} 已通过 OAuth 登录并选择 ${mother.team}${fallbackMessage}${syncMessage}`, syncPartial ? 'partial' : 'success');
   await persist();
   return { ok: true, status: 200, code: 'ready', source: login.oauthFallback ? 'oauth_email_password_2fa_team' : login.sub2api ? 'sub2api_oauth_email_password_2fa_team' : 'oauth_email_password_2fa_team', format: 'team-json', tokenScope: 'team', accountId: workspaceId, expiresAt: workspaceToken.expiresAt, partial: syncPartial, oauthFallback: login.oauthFallback || null, sub2api: login.sub2api || null, exportable: true, child: publicChild(child, mother.team) };
+  });
 }
 
 function hasTeamLoginCredentials(child) {
@@ -5500,6 +5746,7 @@ const AUTO_JSON_MAX_LOGS = 3000;
 const AUTO_JSON_PROGRESS_MESSAGES = {
   initializing: '正在建立登录会话',
   oauth_link: '正在获取 OAuth 授权入口',
+  oauth_local_fallback: '授权链接服务暂不可用，改用本机 OAuth 入口继续本次登录',
   authenticating: '正在后台校验账号登录',
   protocol_email: '正在通过协议提交账号邮箱',
   protocol_password: '正在通过协议校验账号密码',
@@ -5514,14 +5761,32 @@ const AUTO_JSON_PROGRESS_MESSAGES = {
   browser_verification_required: '登录要求浏览器验证，自动流程已暂停',
   browser_start: '正在启动独立浏览器，打开官方授权页面',
   roxy_start: '正在打开账号绑定的 Roxy 窗口',
-  roxy_profile_preparing: '正在为该账号查找或创建独立 Roxy 窗口',
+  roxy_queued: '等待空闲 Roxy 窗口，前一个窗口释放后继续',
+  roxy_pool_preparing: '正在分配空闲 Roxy 环境',
+  roxy_pool_acquired: '已分配空闲环境，本次账号使用隔离登录会话',
+  roxy_profile_preparing: '正在核验账号绑定的 Roxy 环境，失效时重新分配',
   roxy_profile_bound: '已保存该账号的独立 Roxy 窗口绑定',
+  roxy_profile_deleting: 'JSON 已保存，正在确认 Roxy 窗口关闭并释放环境名额',
+  roxy_profile_deleted: '授权环境已移入 Roxy 回收站，窗口用量已释放，本机 JSON 保留',
+  roxy_profile_delete_failed: 'JSON 已保存，但 Roxy 环境名额未释放，请检查 Roxy 后重试清理',
+  roxy_failed_profile_deleting: '本次授权失败，正在确认 Roxy 窗口关闭并释放环境名额',
+  roxy_failed_profile_deleted: '失败环境已移入 Roxy 回收站，窗口用量已释放，可在运行日志中重试',
+  roxy_failed_profile_delete_failed: '本次授权失败，且 Roxy 环境名额未释放，请检查窗口状态后再重试',
+  roxy_proxy_attempt: '正在使用代理授权，每账号最多尝试 3 条',
+  roxy_proxy_switch: '代理连接失败，已确认旧窗口关闭，正在切换下一条代理',
+  roxy_proxy_exhausted: '可用代理尝试已结束，本账号停止重试，批量任务继续下一个',
   roxy_cleanup_failed: 'Roxy 窗口关闭未完成，请在 Roxy 中检查并关闭本次窗口',
   roxy_window_left_open: '自动登录已暂停，有头 Roxy 窗口已保留；请查看页面提示，关闭窗口后再重试',
   browser_email: '正在提交账号邮箱',
   browser_password: '正在提交账号密码',
   browser_totp: '正在提交当前六位 2FA 验证码',
   browser_workspace: '正在选择目标授权工作空间',
+  browser_workspace_wait: '正在等待目标 Team 工作空间加载',
+  browser_navigation: '已连接 Roxy 浏览器，正在打开官方授权页面',
+  browser_oauth_proxy_connection_failed: '浏览器代理连接失败，请检查本机代理和上游代理',
+  browser_oauth_network_failed: '官方授权页面网络连接失败，本账号已停止',
+  browser_oauth_browser_disconnected: '授权过程中浏览器连接已断开，本账号已停止',
+  browser_oauth_navigation_timeout: '打开官方授权页面超时，本账号已停止',
   browser_callback: '已收到授权回调，正在兑换并保存 JSON',
   browser_http_forbidden: '官方登录页面或认证接口返回 HTTP 403，自动流程已暂停',
 };
@@ -5536,9 +5801,15 @@ function appendAutoJsonLog(job, child, stage, status, message, httpStatus = null
 }
 
 function autoJsonLoginProgress(job, child, stage) {
-  return (phase) => {
-    const message = Object.hasOwn(AUTO_JSON_PROGRESS_MESSAGES, phase) ? AUTO_JSON_PROGRESS_MESSAGES[phase] : null;
-    if (message) appendAutoJsonLog(job, child, stage, phase === 'roxy_cleanup_failed' ? 'warning' : ['phone_verification_required', 'browser_verification_required'].includes(phase) ? 'needs_attention' : 'running', message);
+  return (phase, detail) => {
+    let message = Object.hasOwn(AUTO_JSON_PROGRESS_MESSAGES, phase) ? AUTO_JSON_PROGRESS_MESSAGES[phase] : null;
+    if (['roxy_proxy_attempt', 'roxy_proxy_switch', 'roxy_proxy_exhausted'].includes(phase)) {
+      const count = String(detail || '').match(/^(?:正在使用第 |代理连接失败，旧窗口已关闭，切换第 |已尝试 )([1-3])(?:\/3 条代理| 条代理)/)?.[1];
+      // Only a bounded counter enters the public log, never arbitrary detail
+      // from an upstream exception, authorization URL or proxy credential.
+      if (count) message += `（${count}/3）`;
+    }
+    if (message) appendAutoJsonLog(job, child, stage, ['roxy_cleanup_failed', 'roxy_proxy_exhausted', 'roxy_profile_delete_failed', 'roxy_failed_profile_delete_failed'].includes(phase) ? 'warning' : ['phone_verification_required', 'browser_verification_required'].includes(phase) ? 'needs_attention' : 'running', message);
   };
 }
 
@@ -5558,6 +5829,7 @@ function publicAutoJsonJob(job) {
     motherId: job.motherId || null,
     workspaceId: job.workspaceId || null,
     retryJobId: job.retryJobId || null,
+    retryAccount: Boolean(job.retryAccount),
     retriedIds: [...(job.retriedIds || [])],
     status: job.status,
     total: job.ids.length,
@@ -5611,7 +5883,12 @@ function autoJsonResult(child, acquired, { mother = null, phase = 'free_auth', a
     password_invalid: '登录密码校验失败，请检查账号凭据',
     browser_oauth_credentials_rejected: '官方提示邮箱、密码或验证码不正确，请核对该账号保存的凭据',
     browser_oauth_input_mismatch: '浏览器输入与已保存凭据不一致，已停止提交，请检查页面输入控件',
-    browser_oauth_timeout: '授权等待超时；有头 Roxy 窗口会保留，请检查页面提示',
+    browser_oauth_timeout: '授权等待超时，本账号已停止；可检查网络或页面提示后勾选重试',
+    browser_oauth_proxy_connection_failed: '浏览器代理连接失败，请检查本机代理和上游代理后勾选重试',
+    browser_oauth_network_failed: '官方授权页面网络连接失败，请检查网络后勾选重试',
+    browser_oauth_browser_disconnected: '授权过程中浏览器连接已断开，请检查 Roxy 后勾选重试',
+    browser_oauth_navigation_timeout: '打开官方授权页面超时，请检查网络后勾选重试',
+    browser_oauth_failed: '浏览器授权未完成，请根据阶段日志检查后勾选重试',
     oauth_session_expired: '原授权会话已过期，请通过手动获取重新授权',
     account_banned: '账号已封禁，无法获取 JSON',
     token_identity_mismatch: '授权账号身份不一致，已保留原凭据',
@@ -5623,6 +5900,8 @@ function autoJsonResult(child, acquired, { mother = null, phase = 'free_auth', a
     member_verification_failed: '无法确认目标 Team 成员身份，请检查母号权限',
     team_workspace_changed: '目标 Team 配置已改变，请重新选择 Team',
     team_membership_changed: '账号已移出目标 Team 或成员状态已变更，请重新核验后授权',
+    team_token_changed: 'Team 授权已更新，请重新获取当前状态',
+    team_token_refresh_failed: '已有 Team JSON 的令牌刷新失败，已保留原凭据；请检查网络或通过手动获取重新授权',
     seat_capacity_unavailable: '无法确认已购席位，未接受邀请',
     seat_capacity_exhausted: '目标 Team 没有可用的已购席位，未接受邀请',
     seat_type_mismatch: '成员实际席位与预期席位不一致，已停止后续 Team 授权，请核实 Team 默认席位设置',
@@ -5648,6 +5927,7 @@ function autoJsonResult(child, acquired, { mother = null, phase = 'free_auth', a
     httpStatus: ready ? null : Number(acquired.upstreamStatus || acquired.status || login.httpStatus) || null,
     source: acquired.source || null,
     reused: ready && acquired.source === 'stored_team_token',
+    ...(acquired.roxyCleanup ? { roxyCleanup: acquired.roxyCleanup } : {}),
     browserRequired: !ready && Boolean(acquired.browserRequired ?? login.browserRequired),
     authUrl: attention ? safeAutoJsonAuthUrl(acquired.authUrl || login.authUrl) : null,
   };
@@ -5691,8 +5971,8 @@ async function performAutoFreeJson(id, onProgress = () => {}, { retryFailed = fa
       });
       if (findChild(id) !== child) return autoJsonResult(null, { id, ok: false, code: 'child_not_found' });
       return autoJsonResult(child, result);
-    } catch {
-      return autoJsonResult(child, { ok: false, code: 'auto_json_failed' });
+    } catch (error) {
+      return autoJsonResult(child, { ok: false, code: 'auto_json_failed', roxyCleanup: roxyAuthorizationFailureCleanup.get(error) });
     }
 }
 
@@ -5716,6 +5996,68 @@ function storedAutoTeamJsonResult(job, child, mother) {
   };
 }
 
+async function refreshStoredAutoTeamJson(job, child, mother) {
+  const latestMembership = latestMembershipHistoryFor(child, mother.team);
+  if (!isChildMemberOfTeam(child, mother.team) || (latestMembership && latestMembership.status !== 'active')
+    || !completeTeamJsonFor(child, mother, { allowExpired: true })) return null;
+  const workspaceId = job.workspaceId;
+  const email = child.email;
+  const userId = child.chatgptUserId;
+  const membership = membershipFor(child, mother.team);
+  const team = mother.team;
+  const fail = (code, status = null) => autoJsonResult(child, { ok: false, code, status }, { mother, phase: 'team_auth' });
+  const currentFailure = () => {
+    if (findChild(child.id) !== child || child.email !== email || child.chatgptUserId !== userId) return fail('token_identity_mismatch');
+    if (findMother(mother.id) !== mother || configuredTeamId(mother) !== workspaceId || mother.team !== team) return fail('team_workspace_changed');
+    if (membershipFor(child, team) !== membership || !isChildMemberOfTeam(child, team)
+      || latestMembershipHistoryFor(child, team) !== latestMembership) return fail('team_membership_changed');
+    return childIsBanned(child) ? fail('account_banned') : null;
+  };
+  const key = String(child.id);
+  const previous = childAuthQueues.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(async () => {
+    if (currentFailure()) return currentFailure();
+    const ready = storedAutoTeamJsonResult(job, child, mother);
+    if (ready) return ready;
+    const token = completeTeamJsonFor(child, mother, { allowExpired: true });
+    if (!token) return fail('team_token_changed');
+    const beforeAccessToken = token.accessToken;
+    const beforeRefreshToken = token.refreshToken;
+    appendAutoJsonLog(job, child, 'team_auth', 'running', '已有 Team JSON，正在刷新到期令牌，无需重复浏览器登录');
+    try {
+      const result = await withChildAuthorizationNetwork(child, true, async () => {
+        if (currentFailure()) return currentFailure();
+        const refreshed = await refreshOpenAiAccessToken(beforeRefreshToken, token.clientId, OPENAI_REQUEST_TIMEOUT_MS, proxyFetch);
+        if (currentFailure()) return currentFailure();
+        const latest = child.workspaceTokens?.[workspaceId];
+        if (latest?.accessToken !== beforeAccessToken || latest?.refreshToken !== beforeRefreshToken) return fail('team_token_changed');
+        const candidate = { ...token, accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken || beforeRefreshToken };
+        if (!refreshed.ok || !completeTeamJsonFor({ ...child, workspaceTokens: { [workspaceId]: candidate } }, mother)) {
+          return fail('team_token_refresh_failed', refreshed.status);
+        }
+        const saved = saveWorkspaceToken(child, workspaceId, refreshed.accessToken, accessTokenClaims(refreshed.accessToken), {
+          refreshToken: candidate.refreshToken, idToken: refreshed.idToken || token.idToken || '',
+          clientId: token.clientId || '', source: 'team_refresh_token',
+        });
+        resetTeamLoginState(child, workspaceId, '已有 Team JSON 的令牌已刷新');
+        if (membership) Object.assign(membership, { workspaceTokenStatus: 'ready', workspaceTokenUpdatedAt: saved.acquiredAt,
+          teamAuthLastError: null, teamAuthRetryAfter: null });
+        await persist();
+        if (currentFailure()) return currentFailure();
+        const stored = storedAutoTeamJsonResult(job, child, mother);
+        return stored ? { ...stored, refreshed: true, message: '已有 Team JSON 的令牌已刷新，已跳过重复登录' } : fail('team_token_changed');
+      });
+      return result?.id === child.id ? result : fail('team_token_refresh_failed');
+    } catch {
+      return fail('team_token_refresh_failed');
+    }
+  });
+  childAuthQueues.set(key, current);
+  try { return await current; } finally {
+    if (childAuthQueues.get(key) === current) childAuthQueues.delete(key);
+  }
+}
+
 async function autoAcquireTeamJson(job, id) {
   return withAutoJsonAccountWork(id, `team:${job.workspaceId}`, async () => {
     const child = findChild(id);
@@ -5729,6 +6071,12 @@ async function autoAcquireTeamJson(job, id) {
     // member APIs, token refresh or browser login. Quota has its own refresh UI.
     const storedResult = storedAutoTeamJsonResult(job, child, mother);
     if (storedResult) return storedResult;
+    // A completed browser callback can replace an invalid old RT. Consume it
+    // through the existing verified callback path instead of retrying that RT.
+    if (!pendingOAuthCallback(child.teamAuthSessions?.[job.workspaceId])) {
+      const refreshedResult = await refreshStoredAutoTeamJson(job, child, mother);
+      if (refreshedResult) return refreshedResult;
+    }
     const email = child.email;
     let confirmedMembership = null;
     const currentFailure = () => {
@@ -5818,8 +6166,8 @@ async function autoAcquireTeamJson(job, id) {
       let membership = await synchronizeMembership(false);
       if (membership.result) return membership.result;
       if (membership.needsFree) {
-        appendAutoJsonLog(job, child, 'free_auth', 'running', '正在准备接受邀请所需的子号授权');
-        const free = await performAutoFreeJson(id, autoJsonLoginProgress(job, child, 'free_auth'), { retryFailed: job.retryFailed });
+        appendAutoJsonLog(job, child, 'free_auth', 'running', '先获取接受邀请所需的个人授权；加入确认后会继续获取目标 Team JSON');
+        const free = await performAutoFreeJson(id, autoJsonLoginProgress(job, child, 'free_auth'), { retryFailed: job.retryFailed || job.retryAccount });
         if (currentFailure()) return currentFailure();
         if (free.status !== 'ready') return { ...free, scope: 'team', authScope: 'free', phase: 'free_auth', motherId: mother.id, workspaceId: job.workspaceId, quotaChecked: false, quotaStatus: 'unknown', quota5h: null, quota7d: null };
         appendAutoJsonLog(job, child, 'free_auth', 'ready', '子号授权已就绪');
@@ -5841,7 +6189,7 @@ async function autoAcquireTeamJson(job, id) {
       if (callback) acquired = await acquireTeamAuth(mother, child, { force: true, callbackUrl: callback, persistOwner: false, browserLogin: true, expectedMembership: confirmedMembership, onProgress });
       else {
         const login = teamLoginFor(child, job.workspaceId);
-        if (!job.retryFailed && (login?.needsInput || login?.browserRequired) && login.code !== 'workspace_list_unavailable'
+        if (!job.retryFailed && !job.retryAccount && (login?.needsInput || login?.browserRequired) && login.code !== 'workspace_list_unavailable'
           && !String(login.code || '').startsWith('roxy_')
           && !retryWithChangedLoginBackend(child, job.workspaceId)) acquired = { ok: false, code: login.code || login.status, stage: login.stage, status: login.httpStatus, needsInput: true, browserRequired: login.browserRequired, authUrl: login.authUrl };
         else acquired = await acquireTeamAuth(mother, child, { force: true, persistOwner: false, browserLogin: true, expectedMembership: confirmedMembership, onProgress });
@@ -5855,7 +6203,7 @@ async function autoAcquireTeamJson(job, id) {
       appendAutoJsonLog(job, child, 'quota', 'running', '正在使用 Team 授权查询真实额度');
       // A quota transport failure must never turn a saved JSON into an auth
       // failure (and invite an unnecessary second browser login).
-      const quota = await probeUsage(teamToken.accessToken, job.workspaceId)
+      const quota = await withChildAuthorizationNetwork(child, true, () => probeUsage(teamToken.accessToken, job.workspaceId))
         .catch(() => ({ ok: false, status: 502, message: 'quota_query_failed' }));
       return withTeamMaintenanceLock(job.motherId, 'auto_team_json_quota', async () => {
         if (currentFailure()) return currentFailure();
@@ -5877,8 +6225,8 @@ async function autoAcquireTeamJson(job, id) {
           quotaCode: 'quota_save_failed', quotaHttpStatus: Number(quota.status) || null,
           message: 'Team JSON 已保存，额度处理或保存失败，请重新检测额度' };
       });
-    } catch {
-      return autoJsonResult(child, { ok: false, code: 'auto_json_failed' }, context);
+    } catch (error) {
+      return autoJsonResult(child, { ok: false, code: 'auto_json_failed', roxyCleanup: roxyAuthorizationFailureCleanup.get(error) }, context);
     }
   });
 }
@@ -5926,10 +6274,19 @@ function startAutoJsonJob(body) {
     return { status: 400, payload: { message: 'child_ids_required' } };
   }
   const ids = body.ids === undefined
-    ? state.children.filter((child) => !childIsBanned(child) && (mother ? invitationForTeam(child, mother)?.status === 'invited' || isChildMemberOfTeam(child, mother.team) : !child.refreshToken || freeTokenNeedsRefresh(child))).map((child) => child.id)
+    ? state.children.filter((child) => !childIsBanned(child) && (mother
+      ? (invitationForTeam(child, mother)?.status === 'invited' || isChildMemberOfTeam(child, mother.team))
+        && !storedAutoTeamJsonResult({ workspaceId }, child, mother)
+      : !child.refreshToken || freeTokenNeedsRefresh(child))).map((child) => child.id)
     : [...new Set(body.ids.map((id) => String(id || '').trim()).filter(Boolean))];
   if (body.ids !== undefined && !ids.length) return { status: 400, payload: { message: 'child_ids_required' } };
   if (ids.some((id) => !findChild(id))) return { status: 404, payload: { message: 'child_not_found' } };
+  const retryAccount = body.retryAccount === true;
+  if ((body.retryAccount !== undefined && typeof body.retryAccount !== 'boolean')
+    || (retryAccount && (scope !== 'team' || body.ids === undefined || ids.length !== 1
+      || body.retryFailed !== undefined || body.retryJobId !== undefined))) {
+    return { status: 400, payload: { message: 'invalid_retry_request' } };
+  }
   const retryFailed = body.retryFailed === true;
   const retryJobId = retryFailed ? String(body.retryJobId || '').trim() : null;
   if ((body.retryFailed !== undefined && typeof body.retryFailed !== 'boolean') || (!retryFailed && body.retryJobId !== undefined)) {
@@ -5945,7 +6302,7 @@ function startAutoJsonJob(body) {
     const failedIds = new Set(retrySource.results.filter((result) => ['failed', 'needs_attention'].includes(result.status)).map((result) => result.id));
     if (ids.some((id) => !failedIds.has(id))) return { status: 400, payload: { message: 'retry_failed_accounts_only' } };
   }
-  const key = JSON.stringify([scope, mother?.id || null, workspaceId, [...ids].sort(), retryJobId]);
+  const key = JSON.stringify([scope, mother?.id || null, workspaceId, [...ids].sort(), retryJobId, retryAccount]);
   for (const [id, job] of autoJsonJobs) {
     if (job.status === 'complete' && Date.now() - Date.parse(job.finishedAt) > AUTO_JSON_JOB_TTL_MS) autoJsonJobs.delete(id);
     else if (job.key === key && (job.status !== 'complete' || retryFailed)) return { status: 202, payload: { job: publicAutoJsonJob(job), reused: true } };
@@ -5957,8 +6314,8 @@ function startAutoJsonJob(body) {
     autoJsonJobs.delete(complete[0]);
   }
   const concurrency = state.settings.integrations?.roxy?.enabled
-    ? state.settings.integrations.roxy.concurrency : normalizeConcurrency(state.settings.concurrency);
-  const job = { id: randomUUID(), key, ids, scope, motherId: mother?.id || null, workspaceId, retryFailed, retryJobId, status: 'queued', concurrency, createdAt: now(), finishedAt: null, results: [], logs: [], logSequence: 0 };
+    ? roxyConcurrency() : normalizeConcurrency(state.settings.concurrency);
+  const job = { id: randomUUID(), key, ids, scope, motherId: mother?.id || null, workspaceId, retryFailed, retryJobId, retryAccount, status: 'queued', concurrency, createdAt: now(), finishedAt: null, results: [], logs: [], logSequence: 0 };
   if (retrySource) {
     retrySource.retriedIds ||= new Set();
     ids.forEach((id) => retrySource.retriedIds.add(id));
@@ -7611,6 +7968,13 @@ async function handleApi(req, res, url) {
       if (segments.length === 3 && segments[2] === 'export' && method === 'POST') {
         return sendJson(res, 200, exportMailboxVaultRecords(state.mailboxVault, body?.ids));
       }
+      if (segments.length === 3 && segments[2] === 'mark-exported' && method === 'POST') {
+        const selected = markMailboxVaultRecordsExported(state.mailboxVault, body?.records);
+        const updated = new Map(selected.map((record) => [record.id, record]));
+        state.mailboxVault = state.mailboxVault.map((record) => updated.get(record.id) || record);
+        await persist();
+        return sendJson(res, 200, { records: selected.map(publicMailboxVaultRecord) });
+      }
       if (segments.length === 3 && segments[2] === 'batch-delete' && method === 'POST') {
         const selected = selectMailboxVaultRecords(state.mailboxVault, body?.ids);
         const ids = new Set(selected.map((record) => record.id));
@@ -7803,6 +8167,9 @@ async function handleApi(req, res, url) {
     for (const profile of state.settings.integrations?.roxy?.profiles || []) {
       if (ids.has(profile.proxyId)) profile.proxyId = '';
     }
+    for (const child of state.children) {
+      if (ids.has(child.roxyProxyId)) child.roxyProxyId = '';
+    }
     addHistory('删除代理', `已移除 ${ids.size} 条代理；相关窗口下次授权时重新分配代理`);
     await persist();
     return sendJson(res, 200, { deletedIds: [...ids], proxy: publicState({ includeHistory: false }).settings.proxy, state: publicState({ includeHistory: false }) });
@@ -7816,11 +8183,13 @@ async function handleApi(req, res, url) {
         // An omitted key preserves the encrypted secret; an explicit empty key clears it.
         const incoming = { ...body.roxy };
         if (!Object.hasOwn(incoming, 'apiKey')) incoming.apiKey = current.roxy?.apiKey || '';
+        if (current.roxy?.poolProfiles && ((incoming.workspaceId !== undefined && incoming.workspaceId !== current.roxy?.workspaceId)
+          || (incoming.baseUrl !== undefined && incoming.baseUrl !== current.roxy?.baseUrl))) incoming.poolProfiles = [];
         const nextRoxy = normalizeRoxyConfig(incoming, current.roxy || { ...DEFAULT_ROXY_CONFIG, profiles: [] });
         if (nextRoxy.profiles.some((entry) => !findChild(entry.childId))) {
           return sendJson(res, 400, { code: 'roxy_child_not_found', message: 'Roxy 绑定的本地账号不存在，请刷新账号列表' });
         }
-        if (childAuthQueues.size && JSON.stringify(nextRoxy) !== JSON.stringify(current.roxy)) {
+        if ((childAuthQueues.size || roxyProfileCleanupJobs) && JSON.stringify(nextRoxy) !== JSON.stringify(current.roxy)) {
           return sendJson(res, 409, { code: 'roxy_profile_busy', message: '账号授权正在运行，请等待任务结束后修改 Roxy 配置' });
         }
         current.roxy = bindRoxyProxyProfiles(nextRoxy);
@@ -7845,6 +8214,49 @@ async function handleApi(req, res, url) {
     addHistory('更新集成', '集成配置已更新');
     await persist();
     return sendJson(res, 200, { settings: publicState({ includeHistory: false }).settings, state: publicState({ includeHistory: false }) });
+  }
+  if (method === 'POST' && url.pathname === '/api/integrations/roxy/cleanup-successful') {
+    const config = state.settings.integrations?.roxy;
+    if (!config?.enabled || config.deleteProfileAfterSuccess !== true) {
+      return sendJson(res, 409, { code: 'roxy_cleanup_disabled', message: '请先开启成功后释放环境名额' });
+    }
+    if (childAuthQueues.size || activeRoxyPoolSlots.size || roxyProfileCleanupJobs) {
+      return sendJson(res, 409, { code: 'roxy_profile_busy', message: '请等待授权任务结束后清理已成功账号的环境' });
+    }
+    if (!Array.isArray(body.childIds) || !body.childIds.length || body.childIds.length > 1000) {
+      return sendJson(res, 400, { code: 'child_ids_required', message: '请选择已保存 JSON 的账号' });
+    }
+    const ids = new Set(body.childIds.map(String));
+    const seen = new Set();
+    const candidates = config.profiles.filter((profile) => {
+      const child = findChild(profile.childId);
+      const claims = accessTokenClaims(child?.accessToken);
+      const knownIdentity = claims.email && workspaceIdKey(claims.email) === workspaceIdKey(child?.email)
+        || claims.userId && child?.chatgptUserId === claims.userId;
+      const saved = child && (child.accessToken && child.refreshToken && knownIdentity && childTokenIdentityMatches(child, child.accessToken)
+        && Number.isFinite(Date.parse(claims.expiresAt || ''))
+        || state.mothers.some((mother) => completeTeamJsonFor(child, mother, { allowExpired: true })));
+      if (!ids.has(profile.childId) || !saved || seen.has(profile.dirId)) return false;
+      seen.add(profile.dirId);
+      return true;
+    });
+    roxyProfileCleanupJobs += 1;
+    let finishCleanup;
+    roxyProfileCleanupFinished = new Promise((resolve) => { finishCleanup = resolve; });
+    const results = [];
+    try {
+      for (const profile of candidates) {
+        try {
+          const result = await releaseSavedRoxyProfile(findChild(profile.childId), config, profile.dirId);
+          results.push({ childId: profile.childId, dirId: profile.dirId, ...result });
+        } catch {
+          results.push({ childId: profile.childId, dirId: profile.dirId, deleted: false, released: false, code: 'roxy_profile_delete_failed' });
+        }
+      }
+    } finally { roxyProfileCleanupJobs -= 1; finishCleanup(); }
+    return sendJson(res, 200, { ok: results.every((result) => result.released),
+      deleted: results.filter((result) => result.deleted).length, results,
+      state: publicState({ includeHistory: false }) });
   }
   if (method === 'POST' && url.pathname === '/api/integrations/roxy/check') {
     try {
@@ -8571,6 +8983,7 @@ function canHandleScopedMutationConcurrently(req) {
   try { pathname = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`).pathname; } catch { return false; }
   if (pathname === '/mcp' || pathname === '/api/auth/login' || pathname === '/api/auth/logout') return true;
   if (pathname === '/api/children/auto-json') return true;
+  if (pathname === '/api/integrations/roxy/cleanup-successful') return true;
   if (['/api/maintenance/check', '/api/maintenance/check-all', '/api/maintenance/refill', '/api/maintenance/refill-all', '/api/sub2api/team-push'].includes(pathname)) return true;
   if (/^\/api\/mothers\/[^/]+$/.test(pathname)) return true;
   if (/^\/api\/mothers\/[^/]+\/recover$/.test(pathname)) return true;

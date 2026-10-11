@@ -144,6 +144,45 @@ test('legacy unscoped removal still selects current Team and retains a different
   assert.equal(child.workspaceHistory[1].status, 'active');
 });
 
+test('removing the final Team member link enables local deletion while another active Team blocks it', async (t) => {
+  const removedTeams = new Set();
+  const app = await fixture(t, { onRequest: (entry) => {
+    if (entry.method === 'DELETE') {
+      removedTeams.add(entry.workspaceId);
+      return { payload: { success: true } };
+    }
+    if (entry.method === 'GET' && /\/users$/.test(entry.path)) {
+      const items = defaultMembers(entry.workspaceId)
+        .filter((item) => !removedTeams.has(entry.workspaceId) || item.email !== email);
+      return { payload: { items, total: items.length, offset: 0 } };
+    }
+    return null;
+  } });
+
+  const first = await app.request();
+  assert.equal(first.status, 200);
+  assert.equal(first.data.localDeletion.eligible, false);
+  assert.equal(first.data.localDeletion.reason, 'child_has_active_team_memberships');
+  const blocked = await app.request('/api/children/member', { method: 'DELETE' });
+  assert.equal(blocked.status, 409);
+  assert.equal(blocked.data.message, 'child_has_active_team_memberships');
+  assert.equal((await app.saved()).children.length, 1);
+
+  const last = await app.request(endpoint, { body: { ...scope, motherId: 'mother-a', workspaceId: 'team-a' } });
+  assert.equal(last.status, 200);
+  assert.equal(last.data.localDeletion.eligible, true);
+  assert.equal(last.data.localDeletion.reason, 'departed_account');
+  const state = (await app.request('/api/state', { method: 'GET' })).data;
+  assert.equal(state.children[0].localDeletion.eligible, true);
+  const removed = await app.request('/api/children/member', { method: 'DELETE' });
+  assert.equal(removed.status, 200, JSON.stringify(removed.data));
+  assert.equal((await app.saved()).children.length, 0);
+  assert.deepEqual(app.requests.filter((entry) => entry.method === 'DELETE').map((entry) => entry.path), [
+    '/backend-api/accounts/team-b/users/member-team-b',
+    '/backend-api/accounts/team-a/users/member-team-a',
+  ], 'local deletion must not make another remote member removal');
+});
+
 test('invalid explicit scope, absent member and pending seat reservations reject before remote removal', async (t) => {
   const app = await fixture(t);
   for (const body of [null, [], { motherId: 'mother-b' }, { workspaceId: 'team-b' }, { motherId: [], workspaceId: 'team-b' }]) {
@@ -163,6 +202,25 @@ test('invalid explicit scope, absent member and pending seat reservations reject
     assert.equal((await app.request()).data.code, 'child_has_pending_seat_claim');
     assert.equal(app.requests.length, 0);
   });
+});
+
+test('captured email guards queued removal against account changes before any remote request', async (t) => {
+  const app = await fixture(t);
+  for (const expectedEmail of [null, '', '   ', 1, [], {}]) {
+    const result = await app.request(endpoint, { body: { ...scope, expectedEmail } });
+    assert.equal(result.status, 400);
+    assert.equal(result.data.code, 'team_kick_identity_required');
+  }
+  const mismatched = await app.request(endpoint, { body: { ...scope, expectedEmail: 'old-member@example.test' } });
+  assert.equal(mismatched.status, 409);
+  assert.equal(mismatched.data.code, 'child_identity_changed_before_kick');
+  assert.equal(app.requests.length, 0, 'invalid or changed identity must not call upstream');
+  assert.equal((await app.saved()).children[0].workspaceHistory[1].status, 'active');
+
+  const matched = await app.request(endpoint, { body: { ...scope, expectedEmail: ` ${email.toUpperCase()} ` } });
+  assert.equal(matched.status, 200);
+  assert.equal(matched.data.ok, true);
+  assert.equal(app.requests.filter((entry) => entry.method === 'DELETE').length, 1);
 });
 
 test('global stale member ID never selects another email, and malformed member pages fail closed', async (t) => {

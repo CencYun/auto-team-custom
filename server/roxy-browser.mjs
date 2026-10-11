@@ -28,11 +28,14 @@ const MESSAGES = {
   roxy_profile_ambiguous: 'Roxy 中存在多个属于该账号的窗口，请在参数配置中手动选择正确窗口',
   roxy_profile_list_incomplete: '未能完整核对 Roxy 窗口列表，暂未创建新窗口，请稍后重试',
   roxy_profile_limit: '已达到本工具的 Roxy 窗口绑定上限，请先清理不再使用的账号绑定',
+  roxy_profile_capacity: 'Roxy 环境数量已达到套餐上限，请释放环境名额或调整套餐',
   roxy_profile_busy: '该 Roxy 窗口已打开或正在执行任务，请先结束占用后重试',
+  roxy_profile_delete_failed: '未能确认 Roxy 环境已移至回收站，请在 Roxy 中检查环境名额',
   roxy_proxy_pool_disabled: 'Roxy 已启用代理池，但工具代理池尚未开启，请先启用代理池',
   roxy_proxy_missing: '该账号绑定的代理不存在或不可用，请在 Roxy 配置中重新选择代理',
   roxy_proxy_invalid: 'Roxy 代理格式无效或协议不支持，请使用 HTTP、HTTPS 或 SOCKS5 代理',
   roxy_proxy_chain_failed: '无法建立本机前置代理到账号固定代理的链路，请检查两端代理设置',
+  roxy_proxy_auth_failed: '无法为 Roxy 隔离登录会话设置代理认证，请检查代理配置后重试',
   roxy_api_unavailable: '无法连接 Roxy 本机 API，请检查应用、API 开关与端口',
   roxy_api_timeout: 'Roxy 本机 API 请求超时',
   roxy_api_auth_failed: 'Roxy API 密钥无效或没有访问权限',
@@ -86,6 +89,12 @@ export function normalizeRoxyConfig(input = {}, previous = {}) {
   if (typeof value.enabled !== 'boolean' || typeof value.headless !== 'boolean'
     || typeof value.useProxyPool !== 'boolean' || typeof value.baseUrl !== 'string'
     || typeof value.apiKey !== 'string' || !Array.isArray(value.profiles)) fail('roxy_config_invalid');
+  if (value.deleteProfileAfterSuccess !== undefined && typeof value.deleteProfileAfterSuccess !== 'boolean') {
+    fail('roxy_config_invalid');
+  }
+  if (value.deleteProfileAfterFailure !== undefined && typeof value.deleteProfileAfterFailure !== 'boolean') {
+    fail('roxy_config_invalid');
+  }
   const apiKey = value.apiKey.trim();
   if (apiKey.length > 1024 || /[\r\n]/.test(apiKey) || value.profiles.length > 1000) fail('roxy_config_invalid');
   const workspaceId = identifier(value.workspaceId, { optional: true });
@@ -101,8 +110,32 @@ export function normalizeRoxyConfig(input = {}, previous = {}) {
     directories.add(dirId);
     return { childId, dirId, ...(proxyId ? { proxyId } : {}) };
   });
+  const profileMode = value.profileMode === undefined ? 'dedicated' : value.profileMode;
+  if (!['dedicated', 'pooled'].includes(profileMode)) fail('roxy_config_invalid');
+  const poolSize = value.poolSize === undefined ? 3 : value.poolSize;
+  const poolProfiles = value.poolProfiles === undefined ? [] : value.poolProfiles;
+  if (!Number.isInteger(poolSize) || poolSize < 1 || poolSize > 3
+    || !Array.isArray(poolProfiles) || poolProfiles.length > 3) fail('roxy_config_invalid');
+  const poolSlots = new Set();
+  const poolDirectories = new Set();
+  const normalizedPoolProfiles = poolProfiles.map((profile) => {
+    if (!profile || typeof profile !== 'object' || !Number.isInteger(profile.slot)
+      || profile.slot < 0 || profile.slot > 2) fail('roxy_config_invalid');
+    const dirId = identifier(profile.dirId);
+    if (poolSlots.has(profile.slot) || poolDirectories.has(dirId)) fail('roxy_profile_conflict');
+    poolSlots.add(profile.slot);
+    poolDirectories.add(dirId);
+    return { slot: profile.slot, dirId };
+  });
   const config = { enabled: value.enabled, headless: value.headless, useProxyPool: value.useProxyPool, concurrency: value.concurrency,
     baseUrl: normalizeRoxyApiBase(value.baseUrl), apiKey, workspaceId, profiles };
+  // Preserve old dedicated configurations byte-for-byte while retaining the
+  // pool mappings when its switch is temporarily turned off.
+  if (value.profileMode !== undefined || value.poolProfiles !== undefined || value.poolSize !== undefined) {
+    Object.assign(config, { profileMode, poolSize, poolProfiles: normalizedPoolProfiles });
+  }
+  if (value.deleteProfileAfterSuccess !== undefined) config.deleteProfileAfterSuccess = value.deleteProfileAfterSuccess;
+  if (value.deleteProfileAfterFailure !== undefined) config.deleteProfileAfterFailure = value.deleteProfileAfterFailure;
   if (config.enabled && !apiKey) fail('roxy_api_key_missing');
   if (config.enabled && !workspaceId) fail('roxy_workspace_missing');
   return config;
@@ -118,6 +151,10 @@ export function publicRoxyConfig(config = {}) {
     apiKeySet: Boolean(config.apiKey),
     workspaceId: config.workspaceId || '',
     profiles: Array.isArray(config.profiles) ? config.profiles.map(({ childId, dirId, proxyId }) => ({ childId, dirId, ...(proxyId ? { proxyId } : {}) })) : [],
+    ...(config.profileMode !== undefined ? { profileMode: config.profileMode, poolSize: config.poolSize ?? 3,
+      poolProfiles: (config.poolProfiles || []).map(({ slot, dirId }) => ({ slot, dirId })) } : {}),
+    ...(config.deleteProfileAfterSuccess !== undefined ? { deleteProfileAfterSuccess: config.deleteProfileAfterSuccess === true } : {}),
+    ...(config.deleteProfileAfterFailure !== undefined ? { deleteProfileAfterFailure: config.deleteProfileAfterFailure === true } : {}),
   };
 }
 
@@ -216,6 +253,9 @@ export function createRoxyApiClient(config = {}, { fetchImpl = globalThis.fetch,
         fail('roxy_response_invalid', 502);
       }
       if (result.code !== 0) {
+        if (/(?:窗口|环境|浏览器|profile|browser).*(?:上限|数量不足|数量已满|数量已用完|limit|quota|maximum)|(?:limit|quota|maximum).*(?:profile|browser)/i.test(String(result.msg || ''))) {
+          fail('roxy_profile_capacity', 409);
+        }
         if (/过期|套餐|订阅|权限|expired|subscription|permission|entitlement/i.test(String(result.msg || ''))) {
           fail('roxy_entitlement_unavailable', 409);
         }
@@ -276,7 +316,69 @@ export function createRoxyApiClient(config = {}, { fetchImpl = globalThis.fetch,
       return { ws: data?.ws };
     },
     async close(dirId) { await request('/browser/close', { method: 'POST', body: { dirId: identifier(dirId) } }); },
+    async softDeleteProfile(workspaceId, dirId) {
+      // https://roxybrowser.com/docs/api-documentation/api-endpoint.html#delete-browser-profile
+      // Roxy 4.0.7 defaults this flag to
+      // false (permanent deletion), so moving to Trash must explicitly use true.
+      const body = { workspaceId: identifier(workspaceId), dirIds: [identifier(dirId)], isSoftDelete: true };
+      try { await request('/browser/delete', { method: 'POST', body }); }
+      catch { fail('roxy_profile_delete_failed', 502); }
+    },
   };
+}
+
+async function listCompleteRoxyProfiles(api, workspaceId) {
+  const profiles = [];
+  const seen = new Set();
+  let total;
+  for (let pageIndex = 1; ; pageIndex += 1) {
+    if (pageIndex > 100) fail('roxy_profile_list_incomplete', 409);
+    const page = await api.listProfiles(workspaceId, { pageIndex, pageSize: 100 });
+    if (!page || !Number.isSafeInteger(page.total) || page.total < 0 || !Array.isArray(page.rows)
+      || page.rows.length > 100 || (total !== undefined && page.total !== total)) fail('roxy_profile_list_incomplete', 409);
+    total = page.total;
+    for (const profile of page.rows) {
+      if (!profile || typeof profile.dirId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(profile.dirId)
+        || seen.has(profile.dirId)) fail('roxy_profile_list_incomplete', 409);
+      seen.add(profile.dirId);
+      profiles.push(profile);
+    }
+    if (seen.size === total) return profiles;
+    if (!page.rows.length || seen.size > total) fail('roxy_profile_list_incomplete', 409);
+  }
+}
+
+function isToolOwnedRoxyProfile(profile) {
+  return /^auto-team:(?:child:[a-zA-Z0-9_-]{1,128}|pool:[0-2])$/.test(profile.windowRemark || '');
+}
+
+export async function deleteClosedRoxyProfile(config, dirId, { client } = {}) {
+  const normalized = normalizeRoxyConfig(config);
+  if (!normalized.enabled) fail('roxy_disabled', 409);
+  const id = identifier(dirId);
+  const leaseKey = `${normalized.baseUrl}:${id}`;
+  if (activeProfiles.has(leaseKey)) fail('roxy_profile_busy', 409);
+  const api = client || createRoxyApiClient(normalized);
+  activeProfiles.add(leaseKey);
+  try {
+    const profiles = await listCompleteRoxyProfiles(api, normalized.workspaceId);
+    const profile = profiles.find((entry) => entry.dirId === id);
+    if (!profile) return { deleted: false, absent: true };
+    if (!isToolOwnedRoxyProfile(profile)) fail('roxy_profile_conflict', 409);
+    const connections = await api.connectionInfo(id);
+    if (connections.some((entry) => entry.dirId === id)) fail('roxy_profile_busy', 409);
+    try {
+      await api.softDeleteProfile(normalized.workspaceId, id);
+      const remaining = await listCompleteRoxyProfiles(api, normalized.workspaceId);
+      if (remaining.some((entry) => entry.dirId === id)) fail('roxy_profile_delete_failed', 502);
+    } catch { fail('roxy_profile_delete_failed', 502); }
+    return { deleted: true };
+  } catch (error) {
+    if (error instanceof RoxyBrowserError && ['roxy_profile_conflict', 'roxy_profile_busy', 'roxy_profile_list_incomplete'].includes(error.code)) {
+      throw error;
+    }
+    fail('roxy_profile_delete_failed', 502);
+  } finally { activeProfiles.delete(leaseKey); }
 }
 
 export async function resolveRoxyAccountProfile(config, childId, { email = '', client } = {}) {
@@ -284,8 +386,7 @@ export async function resolveRoxyAccountProfile(config, childId, { email = '', c
   const id = identifier(childId);
   if (!normalized.enabled) fail('roxy_disabled', 409);
   const bound = normalized.profiles.find((profile) => profile.childId === id);
-  if (bound) return { ...bound, source: 'bound' };
-  if (normalized.profiles.length >= 1000) fail('roxy_profile_limit', 409);
+  if (!bound && normalized.profiles.length >= 1000) fail('roxy_profile_limit', 409);
   const api = client || createRoxyApiClient(normalized);
   const marker = `auto-team:child:${id}`;
   const seen = new Set();
@@ -306,6 +407,9 @@ export async function resolveRoxyAccountProfile(config, childId, { email = '', c
     if (seen.size === total) break;
     if (!page.rows.length || seen.size > total) fail('roxy_profile_list_incomplete', 409);
   }
+  // A local binding can outlive its remote environment. Verify the complete
+  // listing before trusting it; explicit manual bindings need no tool marker.
+  if (bound && seen.has(bound.dirId)) return { ...bound, source: 'bound' };
   if (matches.length > 1) fail('roxy_profile_ambiguous', 409);
   const existing = matches[0];
   if (existing && normalized.profiles.some((profile) => profile.dirId === existing.dirId)) {
@@ -316,7 +420,65 @@ export async function resolveRoxyAccountProfile(config, childId, { email = '', c
     windowRemark: marker,
   });
   if (normalized.profiles.some((entry) => entry.dirId === profile.dirId)) fail('roxy_profile_conflict', 409);
-  return { childId: id, dirId: profile.dirId, source: existing ? 'recovered' : 'created' };
+  return { childId: id, dirId: profile.dirId, ...(bound?.proxyId ? { proxyId: bound.proxyId } : {}),
+    source: existing ? 'recovered' : 'created' };
+}
+
+export async function resolveRoxyPoolProfile(config, slot, { client } = {}) {
+  const normalized = normalizeRoxyConfig(config);
+  if (!normalized.enabled) fail('roxy_disabled', 409);
+  if (normalized.profileMode !== 'pooled' || !Number.isInteger(slot)
+    || slot < 0 || slot >= normalized.poolSize) fail('roxy_config_invalid');
+  const api = client || createRoxyApiClient(normalized);
+  const marker = `auto-team:pool:${slot}`;
+  const profiles = [];
+  const seen = new Set();
+  let total;
+  for (let pageIndex = 1; ; pageIndex += 1) {
+    if (pageIndex > 100) fail('roxy_profile_list_incomplete', 409);
+    const page = await api.listProfiles(normalized.workspaceId, { pageIndex, pageSize: 100 });
+    if (total !== undefined && page.total !== total) fail('roxy_profile_list_incomplete', 409);
+    total = page.total;
+    for (const profile of page.rows) {
+      if (seen.has(profile.dirId)) fail('roxy_profile_list_incomplete', 409);
+      seen.add(profile.dirId);
+      profiles.push(profile);
+    }
+    if (seen.size === total) break;
+    if (!page.rows.length || seen.size > total) fail('roxy_profile_list_incomplete', 409);
+  }
+  const reserved = new Set(normalized.poolProfiles
+    .filter((profile) => profile.slot !== slot && profile.slot < normalized.poolSize)
+    .map((profile) => profile.dirId));
+  const bound = profiles.find((profile) => profile.dirId === normalized.poolProfiles.find((entry) => entry.slot === slot)?.dirId);
+  if (bound && !isToolOwnedRoxyProfile(bound)) fail('roxy_profile_conflict', 409);
+  // A recovered environment may now be bound to a different pool slot. Its
+  // older marker must not override the current local reservation.
+  const matches = profiles.filter((profile) => profile.windowRemark === marker && !reserved.has(profile.dirId));
+  if (matches.length > 1) fail('roxy_profile_ambiguous', 409);
+  const preferred = bound || matches[0];
+  const available = async (profile) => !activeProfiles.has(`${normalized.baseUrl}:${profile.dirId}`)
+    && !(await api.connectionInfo(profile.dirId)).some((entry) => entry.dirId === profile.dirId);
+  if (preferred) {
+    if (reserved.has(preferred.dirId)) fail('roxy_profile_conflict', 409);
+    if (!await available(preferred)) fail('roxy_profile_busy', 409);
+    return { slot, dirId: preferred.dirId, source: bound ? 'bound' : 'recovered' };
+  }
+  // Migrate only this tool's idle environments. The isolated context used
+  // below keeps every account's cookies and local storage out of the profile.
+  const ownedProfiles = profiles.filter(isToolOwnedRoxyProfile);
+  for (const profile of ownedProfiles) {
+    if (!reserved.has(profile.dirId)
+      && await available(profile)) return { slot, dirId: profile.dirId, source: 'reused' };
+  }
+  // Busy and reserved environments still occupy capacity. A missing local
+  // mapping must not turn a full pool into another remote environment.
+  if (ownedProfiles.length >= normalized.poolSize) fail('roxy_profile_busy', 409);
+  const created = await api.createProfile(normalized.workspaceId, {
+    windowName: `AutoTeam 授权环境 ${slot + 1}`, windowRemark: marker,
+  });
+  if (reserved.has(created.dirId) || seen.has(created.dirId)) fail('roxy_profile_conflict', 409);
+  return { slot, dirId: identifier(created.dirId), source: 'created' };
 }
 
 export function validateRoxyCdpEndpoint(value) {
@@ -365,8 +527,8 @@ export function createRoxyCdpTransport(endpoint, { timeoutMs = 30000, WebSocketI
   });
 }
 
-async function connectRoxyBrowser({ browserWSEndpoint, ...options }) {
-  const transport = await createRoxyCdpTransport(browserWSEndpoint, { timeoutMs: options.protocolTimeout });
+async function connectRoxyBrowser({ browserWSEndpoint, transportTimeout, ...options }) {
+  const transport = await createRoxyCdpTransport(browserWSEndpoint, { timeoutMs: transportTimeout });
   try { return await puppeteer.connect({ ...options, transport }); }
   catch { transport.close(); fail('roxy_connect_failed', 503); }
 }
@@ -401,13 +563,19 @@ function retainProfileRelay(leaseKey, relay, api, dirId) {
   retained.timer.unref?.();
 }
 
-export async function openRoxyBrowserSession({ config, childId, proxyEntry, localProxyUrl = '', timeoutMs = 30000 }, {
+export async function openRoxyBrowserSession({ config, childId, profile: profileOverride, proxyEntry, localProxyUrl = '', timeoutMs = 30000, onProfileAcquired = () => {} }, {
   client, connect = connectRoxyBrowser, createRelay = createProxyChainRelay,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), clock = Date.now,
 } = {}) {
+  const operationDeadline = clock() + Math.min(180000, Math.max(1000, Number(timeoutMs) || 30000));
   const normalized = normalizeRoxyConfig(config);
   if (!normalized.enabled) fail('roxy_disabled', 409);
-  const profile = normalized.profiles.find((entry) => entry.childId === childId);
+  const pooled = normalized.profileMode === 'pooled';
+  const profile = pooled && profileOverride
+    ? { dirId: identifier(profileOverride.dirId), ...(profileOverride.proxyId ? { proxyId: identifier(profileOverride.proxyId) } : {}) }
+    : normalized.profiles.find((entry) => entry.childId === childId);
   if (!profile) fail('roxy_profile_missing', 409);
+  if (pooled && !normalized.poolProfiles.some((entry) => entry.dirId === profile.dirId)) fail('roxy_profile_missing', 409);
   if (normalized.useProxyPool) {
     roxyProxyInfo(proxyEntry);
     if (profile.proxyId && profile.proxyId !== proxyEntry.id) fail('roxy_proxy_missing', 409);
@@ -418,18 +586,33 @@ export async function openRoxyBrowserSession({ config, childId, proxyEntry, loca
   const api = client || createRoxyApiClient(normalized, { timeoutMs });
   let browser;
   let page;
+  let context;
   let owned = false;
-  let closed = false;
+  let closePromise;
   let relay;
-  const close = async ({ keepOpen = false } = {}) => {
-    if (closed) return;
-    closed = true;
-    let retainWindow = keepOpen === true && normalized.headless === false && owned && browser && page;
+  let browserProxy;
+  const close = ({ keepOpen = false } = {}) => closePromise ||= (async () => {
+    let retainWindow = !pooled && keepOpen === true && normalized.headless === false && owned && browser && page;
     try {
-      if (!retainWindow) await page?.close().catch(() => {});
+      if (!retainWindow) {
+        if (context) await context.close().catch(() => {});
+        else await page?.close().catch(() => {});
+      }
       try { await browser?.disconnect(); } catch { /* Never close a user's unrelated browser. */ }
       if (owned && !retainWindow) {
-        try { await api.close(profile.dirId); }
+        try {
+          await api.close(profile.dirId);
+          // The Local API can acknowledge close before the browser exits.
+          // Keep our lease until the real window slot has become available.
+          const deadline = clock() + 10000;
+          for (;;) {
+            let connections;
+            try { connections = await api.connectionInfo(profile.dirId); } catch { /* Retry an unconfirmed close. */ }
+            if (connections && !connections.some((entry) => entry.dirId === profile.dirId)) break;
+            if (clock() >= deadline) fail('roxy_cleanup_failed', 503);
+            await wait(Math.min(250, deadline - clock()));
+          }
+        }
         catch { retainWindow = true; fail('roxy_cleanup_failed', 503); }
       }
     } finally {
@@ -440,10 +623,13 @@ export async function openRoxyBrowserSession({ config, childId, proxyEntry, loca
         }
       } finally { activeProfiles.delete(leaseKey); }
     }
-  };
+  })();
   try {
     const connections = await api.connectionInfo(profile.dirId);
     if (connections.some((entry) => entry.dirId === profile.dirId)) fail('roxy_profile_busy', 409);
+    // Record ownership before proxy/open can fail, but never claim a user's
+    // already-open window. The caller keeps its queue slot through cleanup.
+    onProfileAcquired(profile.dirId);
     await releaseRetainedProfileRelay(leaseKey);
     if (normalized.useProxyPool) {
       if (localProxyUrl) {
@@ -452,18 +638,52 @@ export async function openRoxyBrowserSession({ config, childId, proxyEntry, loca
       }
       // Roxy sees a per-account loopback relay; the stored binding and backend
       // still identify the actual upstream. The relay dials it via the local proxy.
-      await api.updateProxy(normalized.workspaceId, profile.dirId, relay ? { ...proxyEntry, url: relay.url } : proxyEntry);
+      const effectiveProxy = relay ? { ...proxyEntry, url: relay.url } : proxyEntry;
+      browserProxy = roxyProxyInfo(effectiveProxy);
+      await api.updateProxy(normalized.workspaceId, profile.dirId, effectiveProxy);
     }
     const opened = await api.open(normalized.workspaceId, profile.dirId, { headless: normalized.headless });
     owned = true;
     const browserWSEndpoint = validateRoxyCdpEndpoint(opened.ws);
-    try {
-      browser = await connect({ browserWSEndpoint, defaultViewport: null,
-        protocolTimeout: Math.min(60000, Math.max(1000, Number(timeoutMs) || 30000)) });
-      // A dedicated existing profile retains its normal login session; no incognito or fingerprint changes.
-      page = await browser.newPage();
-    } catch { fail('roxy_connect_failed', 503); }
-    return { page, close, keepOpenOnFailure: normalized.headless === false };
+    const deadline = Math.min(operationDeadline, clock() + 60000);
+    for (;;) {
+      try {
+        if (clock() >= deadline) fail('roxy_connect_failed', 503);
+        browser = await connect({ browserWSEndpoint, defaultViewport: null,
+          // Websocket startup retries need a short handshake timeout. The
+          // Puppeteer protocol timeout persists for the entire connection,
+          // including Page.navigate, so it must retain the OAuth time budget.
+          transportTimeout: Math.max(100, Math.min(5000, deadline - clock())),
+          protocolTimeout: Math.max(1000, operationDeadline - clock()) });
+        if (pooled) {
+          context = await browser.createBrowserContext();
+          page = await context.newPage();
+        } else {
+          // A dedicated existing profile retains its normal login session.
+          page = await browser.newPage();
+        }
+        break;
+      } catch {
+        // Roxy may return the websocket before its browser is ready. Retry
+        // attachment to the same owned window instead of closing/reopening it.
+        try { await context?.close(); } catch { /* A failed target may already be closed. */ }
+        context = undefined;
+        try { await browser?.disconnect(); } catch { /* A failed attachment may already be disconnected. */ }
+        browser = undefined;
+        if (clock() >= deadline) fail('roxy_connect_failed', 503);
+        await wait(Math.min(500, deadline - clock()));
+      }
+    }
+    if (pooled && ['HTTP', 'HTTPS'].includes(browserProxy?.proxyCategory)
+      && (browserProxy.proxyUserName || browserProxy.proxyPassword)) {
+      // An isolated context cannot rely on proxy-auth extensions/state in
+      // the persistent Roxy profile. Answer the actual HTTP proxy's challenge
+      // before the first navigation; a chained relay has its own credentials.
+      try {
+        await page.authenticate({ username: browserProxy.proxyUserName, password: browserProxy.proxyPassword });
+      } catch { fail('roxy_proxy_auth_failed', 503); }
+    }
+    return { page, close, keepOpenOnFailure: !pooled && normalized.headless === false };
   } catch (error) {
     await close();
     throw error instanceof RoxyBrowserError ? error : new RoxyBrowserError('roxy_api_failed', { status: 502 });

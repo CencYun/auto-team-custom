@@ -13,12 +13,13 @@ const authUrl = `https://auth.openai.com/oauth/authorize?state=${state}&redirect
 const options = { authUrl, state, redirectUri, workspaceMode: 'team', workspaceId: 'target-team' };
 
 function fixture({ stages, resultCallback = callbackUrl, responseStatus = 200, responseRequests = [], gotoError, afterFieldClick, gotoCallback = false,
-  alterTypedValue } = {}) {
+  alterTypedValue, workspaceSelectionSticks = true, workspaceSelectionDelay = 0, readErrors = [], afterWorkspaceRead, gotoNeverCompletes = false } = {}) {
   const events = {};
   const typed = [];
   const selected = [];
   const intercepted = [];
-  const runtime = { contextClosed: 0, browserClosed: 0, options: null, authentication: null, submits: 0, keyboard: [], fieldValues: new Map() };
+  const runtime = { contextClosed: 0, browserClosed: 0, options: null, authentication: null, submits: 0, keyboard: [], fieldValues: new Map(),
+    workspaceValue: 'personal-account', workspaceReads: 0, dropdownClicks: 0, labelClicks: 0 };
   const pages = stages || [
     { url: 'https://auth.openai.com/log-in', control: 'email' },
     { url: 'https://auth.openai.com/log-in/password', control: 'password' },
@@ -42,12 +43,49 @@ function fixture({ stages, resultCallback = callbackUrl, responseStatus = 200, r
   function handle(info, name) {
     const fieldKey = `${position}:${name}`;
     if (!runtime.fieldValues.has(fieldKey)) runtime.fieldValues.set(fieldKey, stage().initialValue || '');
+    const selectWorkspace = (value) => {
+      selected.push(value);
+      if (workspaceSelectionSticks) {
+        if (workspaceSelectionDelay) setTimeout(() => { runtime.workspaceValue = value; }, workspaceSelectionDelay);
+        else runtime.workspaceValue = value;
+      }
+    };
+    const form = { getAttribute: () => info.action || '', querySelectorAll: () => info.directSubmit ? [] : [{
+      tagName: 'INPUT', type: 'hidden', disabled: false, value: runtime.workspaceValue,
+    }] };
+    const visibleRect = () => ({ width: 180, height: 32 });
+    const element = {
+      tagName: info.controlType === 'select' ? 'SELECT' : info.controlType === 'choice' ? 'BUTTON' : 'INPUT',
+      type: info.controlType === 'choice' ? info.directSubmit ? 'submit' : 'button' : 'radio',
+      name: info.controlType !== 'choice' || info.directSubmit ? 'workspace_id' : '',
+      dataset: { value: info.value, kind: info.kind || '' },
+      get value() { return info.controlType === 'select' ? runtime.workspaceValue : info.value; },
+      get checked() { return runtime.workspaceValue === info.value; },
+      labels: [{ innerText: info.label || '', getBoundingClientRect: visibleRect }],
+      form: info.hasForm === false ? null : form,
+      closest: () => info.hasForm === false ? null : form,
+      getBoundingClientRect: () => info.clickLabel ? { width: 0, height: 0 } : visibleRect(),
+      getAttribute: (attribute) => attribute === 'aria-checked' && !info.detachedChoice
+        ? String(runtime.workspaceValue === info.value) : null,
+      options: info.options?.map((option) => ({ value: option.value, textContent: option.label,
+        disabled: option.disabled, dataset: { kind: option.kind || '' } })),
+    };
     return {
-      evaluate: async (fn, ...args) => fn.name === 'inspectControl'
-        ? { visible: true, disabled: false, hasForm: true, action: '', label: '', kind: '', value: '', ...info }
-        : fn({ value: runtime.fieldValues.get(fieldKey) }, ...args),
+      evaluate: async (fn, ...args) => {
+        if (fn.name === 'inspectControl') return { visible: true, disabled: false, hasForm: true, action: '', label: '', kind: '', value: '', ...info };
+        if (fn.name === 'inspectWorkspaceControl') return runInNewContext(`(${fn.toString()})(element)`, {
+          element, window: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
+        });
+        return fn({ value: runtime.fieldValues.get(fieldKey) }, ...args);
+      },
       click: async () => {
-        if (name === 'submit') {
+        if (name === 'dropdown') {
+          runtime.dropdownClicks += 1;
+          stage().dropdownOpen = true;
+          return;
+        }
+        if (name === 'submit' || info.directSubmit) {
+          if (info.directSubmit) selected.push(info.value);
           runtime.submits += 1;
           if (stage().forbiddenResponse) emitForbidden(stage().forbiddenResponse);
           if (position < pages.length - 1) { position += 1; return; }
@@ -60,7 +98,9 @@ function fixture({ stages, resultCallback = callbackUrl, responseStatus = 200, r
         } else {
           focused = fieldKey;
           allSelected = false;
-          if (name === 'workspace') selected.push(info.value);
+          if (name === 'workspace') {
+            selectWorkspace(info.value);
+          }
           afterFieldClick?.(pages, position, name);
         }
       },
@@ -68,6 +108,13 @@ function fixture({ stages, resultCallback = callbackUrl, responseStatus = 200, r
         typed.push({ name, value });
         const next = runtime.fieldValues.get(fieldKey) + value;
         runtime.fieldValues.set(fieldKey, alterTypedValue ? alterTypedValue(next, name) : next);
+      },
+      select: async (value) => { selectWorkspace(value); },
+      evaluateHandle: async (fn) => {
+        assert.ok(runInNewContext(`(${fn.toString()})(element)`, {
+          element, window: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
+        }));
+        return { asElement: () => ({ click: async () => { runtime.labelClicks += 1; selectWorkspace(info.value); } }), dispose: async () => {} };
       },
     };
   }
@@ -86,7 +133,8 @@ function fixture({ stages, resultCallback = callbackUrl, responseStatus = 200, r
     setRequestInterception: async () => {}, on: (name, listener) => { events[name] = listener; },
     mainFrame: () => frame, url: () => stage().url,
     goto: async () => {
-      if (gotoError) throw new Error(gotoError);
+      if (gotoNeverCompletes) await new Promise(() => {});
+      if (gotoError) throw gotoError instanceof Error ? gotoError : new Error(gotoError);
       if (gotoCallback) {
         await events.request({
           url: () => resultCallback, method: () => 'GET', isNavigationRequest: () => true,
@@ -97,7 +145,11 @@ function fixture({ stages, resultCallback = callbackUrl, responseStatus = 200, r
       if (responseStatus === 403) emitForbidden({ navigation: true, resourceType: 'document' });
       responseRequests.forEach(emitForbidden);
     },
-    evaluate: async (fn) => {
+    evaluate: async (fn, ...args) => {
+      if (readErrors.length) throw new Error(readErrors.shift());
+      if (fn.name === 'inspectWorkspaceFormSelection') return runInNewContext(`(${fn.toString()})(expected)`, {
+        expected: args[0], document: { querySelectorAll: () => [{ disabled: false, form: {}, type: 'hidden', value: runtime.workspaceValue }] },
+      });
       const inspected = runInNewContext(`(${fn.toString()})()`, {
         document: { body: { innerText: stage().bodyText || '' }, querySelectorAll: () => [] },
         window: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
@@ -106,8 +158,13 @@ function fixture({ stages, resultCallback = callbackUrl, responseStatus = 200, r
         rejected: Boolean(stage().rejected) || inspected.rejected };
     },
     $$: async (selector) => {
+      if (selector.startsWith('button[role="combobox"]')) return stage().dropdown ? [handle({}, 'dropdown')] : [];
       if (selector.startsWith('button')) return stage().noSubmit ? [] : [handle({ action: stage().submitAction || '' }, 'submit')];
       if (selector.startsWith('input[type="radio"]')) {
+        runtime.workspaceReads += 1;
+        afterWorkspaceRead?.(stage(), runtime.workspaceReads);
+        if (stage().dropdown && !stage().dropdownOpen) return [];
+        if (stage().control === 'workspace-select') return [handle({ controlType: 'select', options: stage().entries }, 'workspace')];
         return stage().control === 'workspace' ? (stage().entries || []).map((entry) => handle(entry, 'workspace')) : [];
       }
       const name = selector.startsWith('input[type="email"]') ? 'email'
@@ -141,7 +198,7 @@ test('ordinary browser form flow submits email, password and TOTP, chooses exact
   assert.deepEqual(fake.selected, ['target-team']);
   assert.deepEqual(fake.intercepted, ['abort']);
   assert.deepEqual(logs.map((entry) => entry.phase), [
-    'browser_start', 'browser_email', 'browser_password', 'browser_totp', 'browser_workspace', 'browser_callback',
+    'browser_start', 'browser_navigation', 'browser_email', 'browser_password', 'browser_totp', 'browser_workspace', 'browser_callback',
   ]);
   assert.equal(fake.runtime.contextClosed, 1);
   assert.equal(fake.runtime.browserClosed, 1);
@@ -338,7 +395,7 @@ test('Team selection never falls back to personal space or another Team', async 
     url: 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent', control: 'workspace',
     entries: [{ value: 'personal', label: 'Personal account' }, { value: 'wrong-team', label: 'Team' }],
   }] });
-  await assert.rejects(fake.login(), { code: 'browser_oauth_workspace_unavailable' });
+  await assert.rejects(fake.login({ timeoutMs: 1000 }), { code: 'browser_oauth_workspace_unavailable' });
   assert.deepEqual(fake.selected, []);
   assert.equal(fake.runtime.contextClosed, 1);
   assert.equal(fake.runtime.browserClosed, 1);
@@ -350,6 +407,102 @@ test('Team selection rejects a known personal workspace even when its radio valu
     { value: 'target-team', label: 'Personal account' },
     { value: 'target-team', label: '个人空间' },
   ]) assert.throws(() => selectBrowserWorkspace([entry], 'target-team', 'team'), { code: 'browser_oauth_workspace_unavailable' });
+});
+
+test('native workspace dropdown overrides the default personal space by exact Team ID', async () => {
+  const fake = fixture({ stages: [{
+    url: 'https://auth.openai.com/sign-in-with-chatgpt/codex/consent', control: 'workspace-select',
+    entries: [{ value: 'personal-account', label: 'Personal account' }, { value: 'wrong-team', label: 'Target Team' },
+      { value: 'target-team', label: 'Target Team', kind: 'team' }],
+  }] });
+  assert.deepEqual(await fake.login(), { callbackUrl });
+  assert.deepEqual(fake.selected, ['target-team']);
+  assert.equal(fake.runtime.submits, 1);
+});
+
+test('hidden workspace radios use their visible label and verify the checked value before Continue', async () => {
+  const fake = fixture({ stages: [{ url: 'https://auth.openai.com/workspace', control: 'workspace', entries: [
+    { value: 'personal-account', label: 'Personal account', clickLabel: true },
+    { value: 'target-team', label: 'Team', clickLabel: true },
+  ] }] });
+  assert.deepEqual(await fake.login(), { callbackUrl });
+  assert.deepEqual(fake.selected, ['target-team']);
+  assert.equal(fake.runtime.labelClicks, 1);
+});
+
+test('workspace submit buttons submit the exact target directly without a second generic click', async () => {
+  const fake = fixture({ stages: [{ url: 'https://auth.openai.com/workspace', control: 'workspace', noSubmit: true, entries: [
+    { value: 'personal-account', label: 'Personal account', controlType: 'choice', directSubmit: true },
+    { value: 'target-team', label: 'Team', controlType: 'choice', directSubmit: true },
+  ] }] });
+  assert.deepEqual(await fake.login(), { callbackUrl });
+  assert.deepEqual(fake.selected, ['target-team']);
+  assert.equal(fake.runtime.submits, 1);
+});
+
+test('custom workspace dropdown opens once and confirms its form value after the option disappears', async () => {
+  const fake = fixture({ stages: [{ url: 'https://auth.openai.com/workspace', control: 'workspace', dropdown: true, entries: [
+    { value: 'personal-account', label: 'Personal account', controlType: 'choice', hasForm: false, detachedChoice: true },
+    { value: 'target-team', label: 'Team', controlType: 'choice', hasForm: false, detachedChoice: true },
+  ] }] });
+  assert.deepEqual(await fake.login(), { callbackUrl });
+  assert.deepEqual(fake.selected, ['target-team']);
+  assert.equal(fake.runtime.dropdownClicks, 1);
+  assert.equal(fake.runtime.submits, 1);
+});
+
+for (const control of ['workspace', 'workspace-select']) {
+  test(`a ${control} that remains on personal space after selection never submits consent`, async () => {
+    const fake = fixture({ workspaceSelectionSticks: false, stages: [{
+      url: 'https://auth.openai.com/workspace', control, entries: [
+        { value: 'personal-account', label: 'Personal account' }, { value: 'target-team', label: 'Team' },
+      ],
+    }] });
+    await assert.rejects(fake.login(), { code: 'browser_oauth_workspace_unconfirmed' });
+    assert.equal(fake.runtime.submits, 0);
+    assert.deepEqual(fake.intercepted, []);
+  });
+}
+
+test('partially loaded workspace list waits for the exact Team instead of failing or choosing personal space', async () => {
+  const fake = fixture({ stages: [{ url: 'https://auth.openai.com/workspace', control: 'workspace', entries: [
+    { value: 'personal-account', label: 'Personal account' },
+  ] }], afterWorkspaceRead: (stage, reads) => {
+    if (reads === 2) stage.entries.push({ value: 'target-team', label: 'Team' });
+  } });
+  const logs = [];
+  assert.deepEqual(await fake.login({ onProgress: (phase) => logs.push(phase) }), { callbackUrl });
+  assert.deepEqual(fake.selected, ['target-team']);
+  assert.equal(logs.filter((phase) => phase === 'browser_workspace_wait').length, 1);
+});
+
+test('asynchronous controlled workspace selection waits for its real form value before Continue', async () => {
+  const fake = fixture({ workspaceSelectionDelay: 50, stages: [{
+    url: 'https://auth.openai.com/workspace', control: 'workspace', entries: [
+      { value: 'personal-account', label: 'Personal account' }, { value: 'target-team', label: 'Team' },
+    ],
+  }] });
+  assert.deepEqual(await fake.login(), { callbackUrl });
+  assert.equal(fake.runtime.workspaceValue, 'target-team');
+  assert.equal(fake.runtime.submits, 1);
+});
+
+test('known Team metadata permits a Team name containing Personal without choosing a personal account', () => {
+  assert.equal(selectBrowserWorkspace([{ value: 'target-team', kind: 'team', label: 'Personal Assistant Team' }], 'target-team').value, 'target-team');
+});
+
+test('transient DOM replacement during official page navigation is retried before credential entry', async () => {
+  const fake = fixture({ readErrors: ['Execution context was destroyed, most likely because of a navigation.'] });
+  assert.deepEqual(await fake.login(), { callbackUrl });
+  assert.deepEqual(fake.typed.map((entry) => entry.name), ['email', 'password', 'totp']);
+});
+
+test('an aborted initial navigation may continue only on a recognized official page', async () => {
+  const fake = fixture({ gotoError: 'net::ERR_ABORTED' });
+  assert.deepEqual(await fake.login(), { callbackUrl });
+  const unsafe = fixture({ gotoError: 'net::ERR_ABORTED', stages: [{ url: 'https://evil.example.test/log-in', control: 'email' }] });
+  await assert.rejects(unsafe.login(), { code: 'browser_oauth_page_unsupported' });
+  assert.deepEqual(unsafe.typed, []);
 });
 
 test('Free login accepts a validated direct callback without a workspace selector and lets the runner inspect real claims', async () => {
@@ -495,16 +648,114 @@ test('browser proxy is applied with separate credentials and never falls back to
   }
 });
 
-test('unexpected raw browser error is sanitized and closes isolated resources', async () => {
+test('unexpected raw browser error is sanitized and closes isolated resources', async (t) => {
+  const diagnostics = [];
+  t.mock.method(console, 'warn', (...args) => diagnostics.push(args));
   const fake = fixture({ gotoError: 'fixture-password fixture-cookie fixture-access-token' });
   await assert.rejects(fake.login(), (error) => {
     assert.ok(error instanceof BrowserOAuthError);
     assert.equal(error.code, 'browser_oauth_failed');
+    assert.equal(error.browserRequired, false);
+    assert.equal(error.needsInput, false);
     assert.doesNotMatch(JSON.stringify(error) + error.message, /fixture-password|fixture-cookie|fixture-access-token/);
     return true;
   });
   assert.equal(fake.runtime.contextClosed, 1);
   assert.equal(fake.runtime.browserClosed, 1);
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(JSON.parse(diagnostics[0][1]), { phase: 'navigation', errorName: 'Error', chromiumCode: '', cdpMethod: '' });
+  assert.doesNotMatch(JSON.stringify(diagnostics), /fixture-password|fixture-cookie|fixture-access-token/);
+});
+
+for (const [rawError, expectedCode, expectedStatus] of [
+  ['net::ERR_PROXY_CONNECTION_FAILED', 'browser_oauth_proxy_connection_failed', 502],
+  ['net::ERR_TUNNEL_CONNECTION_FAILED', 'browser_oauth_proxy_connection_failed', 502],
+  ['net::ERR_SOCKS_CONNECTION_FAILED', 'browser_oauth_proxy_connection_failed', 502],
+  ['net::ERR_INVALID_AUTH_CREDENTIALS', 'browser_oauth_proxy_connection_failed', 502],
+  ['net::ERR_PROXY_CERTIFICATE_INVALID', 'browser_oauth_proxy_connection_failed', 502],
+  ['net::ERR_PROXY_HTTP_1_1_REQUIRED', 'browser_oauth_proxy_connection_failed', 502],
+  ['net::ERR_CONNECTION_RESET', 'browser_oauth_network_failed', 502],
+  ['net::ERR_NAME_NOT_RESOLVED', 'browser_oauth_network_failed', 502],
+  ['net::ERR_TIMED_OUT', 'browser_oauth_network_failed', 502],
+  ['Protocol error (Page.navigate): Target closed', 'browser_oauth_browser_disconnected', 503],
+  ['Protocol error: Session closed. Most likely the page has been closed.', 'browser_oauth_browser_disconnected', 503],
+  ['Navigation timeout of 20000 ms exceeded', 'browser_oauth_navigation_timeout', 504],
+]) {
+  test(`navigation failure reports ${expectedCode} without leaking raw error or requesting manual verification: ${rawError}`, async () => {
+    const fake = fixture({ gotoError: `${rawError} at https://private-user:private-password@private-proxy.test/path?state=private-state&code=private-code` });
+    const logs = [];
+    await assert.rejects(fake.login({ onProgress: (phase, message) => logs.push({ phase, message }) }), (error) => {
+      assert.equal(error.code, expectedCode);
+      assert.equal(error.status, expectedStatus);
+      assert.equal(error.browserRequired, false);
+      assert.equal(error.needsInput, false);
+      assert.doesNotMatch(JSON.stringify(error) + error.message + JSON.stringify(logs), /private-|https?:\/\//);
+      return true;
+    });
+    assert.deepEqual(logs.map((entry) => entry.phase), ['browser_start', 'browser_navigation', expectedCode]);
+    assert.deepEqual(fake.typed, []);
+    assert.equal(fake.runtime.browserClosed, 1);
+  });
+}
+
+for (const [name, message, chromiumCode, cdpMethod] of [
+  ['Error', 'net::ERR_BLOCKED_BY_CLIENT at https://private-user:private-password@private-proxy.test/?code=private-code', 'ERR_BLOCKED_BY_CLIENT', ''],
+  ['ProtocolError', 'Protocol error (Page.navigate): ERR_BLOCKED_BY_CLIENT at https://private-proxy.test/?token=private-token', 'ERR_BLOCKED_BY_CLIENT', 'Page.navigate'],
+  ['ProtocolError', 'Protocol error (Network.setRequestInterception): private-password https://private-proxy.test/?token=private-token', '', 'Network.setRequestInterception'],
+  ['private-error-name', 'private-password https://private-proxy.test/?ERR_SECRET_NAME=private-token', '', ''],
+  ['ProtocolError', 'Protocol error (Private.password): private-password', '', ''],
+]) {
+  test(`unknown failure diagnostic only includes approved identifiers: ${name}:${chromiumCode}:${cdpMethod}`, async (t) => {
+    const diagnostics = [];
+    t.mock.method(console, 'warn', (...args) => diagnostics.push(args));
+    const error = new Error(message);
+    error.name = name;
+    const fake = fixture({ gotoError: error });
+    await assert.rejects(fake.login(), { code: 'browser_oauth_failed', browserRequired: false, needsInput: false });
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0][0], '[browser-oauth] unclassified browser error');
+    assert.deepEqual(JSON.parse(diagnostics[0][1]), {
+      phase: 'navigation', errorName: name === 'private-error-name' ? 'OtherError' : name, chromiumCode, cdpMethod,
+    });
+    assert.doesNotMatch(JSON.stringify(diagnostics), /private-|https?:|ERR_SECRET_NAME|Private\.password/);
+  });
+}
+
+test('Puppeteer Page.navigate protocolTimeout errors are reported as navigation timeouts', async (t) => {
+  const diagnostics = [];
+  t.mock.method(console, 'warn', (...args) => diagnostics.push(args));
+  const error = new Error("Page.navigate timed out. Increase the 'protocolTimeout' setting in launch/connect calls for a higher timeout if needed.");
+  error.name = 'ProtocolError';
+  const fake = fixture({ gotoError: error });
+  const logs = [];
+  await assert.rejects(fake.login({ onProgress: (phase) => logs.push(phase) }), {
+    code: 'browser_oauth_navigation_timeout', status: 504, browserRequired: false, needsInput: false,
+  });
+  assert.equal(logs.at(-1), 'browser_oauth_navigation_timeout');
+  assert.equal(diagnostics.length, 0);
+  assert.deepEqual(fake.typed, []);
+});
+
+test('navigation deadline is distinguished from waiting for an already loaded authorization page', async () => {
+  const fake = fixture({ gotoNeverCompletes: true });
+  const logs = [];
+  await assert.rejects(fake.login({ timeoutMs: 1000, onProgress: (phase) => logs.push(phase) }), {
+    code: 'browser_oauth_navigation_timeout', status: 504, browserRequired: false, needsInput: false,
+  });
+  assert.equal(logs.at(-1), 'browser_oauth_navigation_timeout');
+  assert.deepEqual(fake.typed, []);
+  assert.equal(fake.runtime.browserClosed, 1);
+});
+
+test('browser disconnect after page navigation receives the same sanitized transport classification', async () => {
+  const fake = fixture({ readErrors: ['Protocol error (Runtime.callFunctionOn): Target closed; private-debug-endpoint'] });
+  const logs = [];
+  await assert.rejects(fake.login({ onProgress: (phase, message) => logs.push({ phase, message }) }), {
+    code: 'browser_oauth_browser_disconnected', status: 503, browserRequired: false, needsInput: false,
+  });
+  assert.equal(logs.at(-1).phase, 'browser_oauth_browser_disconnected');
+  assert.doesNotMatch(JSON.stringify(logs), /private-debug-endpoint/);
+  assert.deepEqual(fake.typed, []);
 });
 
 test('callback with another state is aborted and never returned for token exchange', async () => {

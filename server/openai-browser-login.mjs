@@ -9,7 +9,8 @@ const SELECTORS = {
   email: 'input[type="email"], input[name="email"], input[autocomplete="username"]',
   password: 'input[type="password"]',
   totp: 'input[autocomplete="one-time-code"], input[name="code"], input[name="otp"], input[name="totp"], input[inputmode="numeric"][maxlength="6"]',
-  workspace: 'input[type="radio"][name="workspace_id"]',
+  workspace: 'input[type="radio"][name="workspace_id"], select[name="workspace_id"], button[name="workspace_id"], button[data-workspace-id], [role="radio"][data-workspace-id], [role="radio"][data-value], [role="option"][data-workspace-id], [role="option"][data-value], [role="option"][value]',
+  workspaceDropdown: 'button[role="combobox"], button[aria-haspopup="listbox"]',
   submit: 'button[type="submit"], input[type="submit"]',
 };
 const ERROR_MESSAGES = {
@@ -27,7 +28,11 @@ const ERROR_MESSAGES = {
   browser_oauth_input_mismatch: '登录输入框内容未能正确填入，已停止提交，请检查浏览器输入状态',
   browser_oauth_timeout: '浏览器授权等待超时，可通过手动授权继续',
   browser_oauth_unavailable: '无法启动本机授权浏览器，请检查 Chrome 安装',
-  browser_oauth_failed: '浏览器授权未完成，请查看阶段日志并通过手动授权重试',
+  browser_oauth_failed: '浏览器授权未完成，请查看阶段日志后重试',
+  browser_oauth_proxy_connection_failed: '浏览器无法建立代理连接或上游隧道，请检查本机代理、代理池及上游连通性后重试',
+  browser_oauth_network_failed: '浏览器连接官方授权服务失败，请检查网络或代理连通性后重试',
+  browser_oauth_browser_disconnected: '授权浏览器或标签页连接已断开，请检查 Roxy 窗口是否被关闭或占用后重试',
+  browser_oauth_navigation_timeout: '官方授权页面加载超时，请检查网络或代理后重试',
   browser_oauth_proxy_invalid: '浏览器代理配置无效，未使用直连',
   browser_oauth_socks_auth_unsupported: '浏览器不支持带认证的 SOCKS 代理，请改用 HTTP 代理，未使用直连',
 };
@@ -41,6 +46,55 @@ export class BrowserOAuthError extends Error {
     this.browserRequired = browserRequired;
     this.needsInput = needsInput;
   }
+}
+
+function logUnknownBrowserFailure(error, navigation) {
+  const safeNames = new Set(['Error', 'TypeError', 'TimeoutError', 'ProtocolError', 'TargetCloseError', 'AbortError', 'AggregateError']);
+  const safeMethods = new Set([
+    'Page.navigate', 'Page.enable', 'Page.getFrameTree', 'Page.createIsolatedWorld',
+    'Runtime.evaluate', 'Runtime.callFunctionOn', 'Runtime.addBinding',
+    'Network.enable', 'Network.setRequestInterception', 'Fetch.enable', 'Fetch.continueRequest', 'Fetch.failRequest',
+    'Target.createTarget', 'Target.createBrowserContext', 'Target.closeTarget', 'Target.getTargets',
+    'Target.attachToTarget', 'Target.detachFromTarget', 'Target.setAutoAttach',
+    'Browser.getVersion', 'DOM.describeNode', 'DOM.resolveNode', 'DOM.getContentQuads',
+  ]);
+  const message = String(error?.message || '');
+  const method = message.match(/^Protocol error \(([A-Za-z]+\.[A-Za-z]+)\):/)?.[1]
+    || message.match(/^([A-Za-z]+\.[A-Za-z]+) timed out\./)?.[1];
+  // Extract only a Chromium error token at the start of its error clause;
+  // never scan URLs, query strings or arbitrary payloads for diagnostic text.
+  const chromiumCode = message.match(/^(?:Protocol error \([A-Za-z]+\.[A-Za-z]+\): )?(?:net::)?(ERR_[A-Z_]{1,64})(?=\s|:|$)/)?.[1] || '';
+  try {
+    console.warn('[browser-oauth] unclassified browser error', JSON.stringify({
+      phase: navigation ? 'navigation' : 'browser',
+      errorName: safeNames.has(error?.name) ? error.name : 'OtherError',
+      chromiumCode,
+      cdpMethod: safeMethods.has(method) ? method : '',
+    }));
+  } catch { /* Diagnostics must not replace the original sanitized failure. */ }
+}
+
+function classifyBrowserFailure(error, { navigation = false } = {}) {
+  if (error instanceof BrowserOAuthError || error instanceof RoxyBrowserError) return error;
+  // Raw Chromium/CDP messages can contain credentials, proxy addresses and the
+  // OAuth URL. Inspect them only here; expose fixed codes and messages below.
+  const detail = `${String(error?.name || '')} ${String(error?.code || '')} ${String(error?.message || '')}`;
+  let code = 'browser_oauth_failed';
+  let status = 502;
+  if (/\bERR_(?:PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED|SOCKS_CONNECTION_FAILED|SOCKS_CONNECTION_HOST_UNREACHABLE|NO_SUPPORTED_PROXIES|PROXY_AUTH_UNSUPPORTED|PROXY_AUTH_REQUESTED|INVALID_AUTH_CREDENTIALS|PROXY_CERTIFICATE_INVALID|PROXY_HTTP_1_1_REQUIRED)\b/i.test(detail)) {
+    code = 'browser_oauth_proxy_connection_failed';
+  } else if (/TargetCloseError|Target closed|Session closed|Connection closed|browser (?:has )?disconnected|Target page, context or browser has been closed|Browser closed/i.test(detail)) {
+    code = 'browser_oauth_browser_disconnected';
+    status = 503;
+  } else if (navigation && (/TimeoutError|Navigation timeout|navigation.*timed out|Timed out.*navigat/i.test(detail)
+    || /^Page\.navigate timed out\./.test(String(error?.message || '')))) {
+    code = 'browser_oauth_navigation_timeout';
+    status = 504;
+  } else if (/\bERR_(?:CONNECTION_[A-Z_]+|NAME_NOT_RESOLVED|DNS_[A-Z_]+|NETWORK_[A-Z_]+|INTERNET_DISCONNECTED|ADDRESS_[A-Z_]+|SSL_[A-Z_]+|CERT_[A-Z_]+|TIMED_OUT|EMPTY_RESPONSE|HTTP_RESPONSE_CODE_FAILURE)\b|\b(?:ECONNRESET|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)\b/i.test(detail)) {
+    code = 'browser_oauth_network_failed';
+  }
+  if (code === 'browser_oauth_failed') logUnknownBrowserFailure(error, navigation);
+  return new BrowserOAuthError(code, { status, browserRequired: false, needsInput: false });
 }
 
 function urlFor(value, code = 'browser_oauth_options_invalid') {
@@ -124,7 +178,8 @@ function normalizeProxy(proxy) {
 
 export function selectBrowserWorkspace(entries, workspaceId, workspaceMode = 'team') {
   const personal = (entry) => /^(?:personal|individual|free)$/i.test(entry.kind || '')
-    || /\bpersonal\b|个人(?:空间|账户|账号)?/i.test(entry.label || '');
+    || (!/^(?:team|business|enterprise)$/i.test(entry.kind || '')
+      && /\bpersonal\b|个人(?:空间|账户|账号)?/i.test(entry.label || ''));
   const matches = workspaceMode === 'team'
     ? entries.filter((entry) => entry.value === workspaceId && !personal(entry))
     : entries.filter(personal);
@@ -160,12 +215,136 @@ function inspectControl(element) {
   return {
     visible: rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden',
     disabled: element.disabled || element.readOnly,
-    value: element.type === 'radio' ? element.value : '',
+    value: element.type === 'radio' || element.name === 'workspace_id' ? element.value : '',
     kind: element.dataset.kind || element.dataset.workspaceType || element.dataset.type || '',
     label: label.slice(0, 300),
-    action: element.form?.getAttribute('action') || '',
-    hasForm: Boolean(element.form),
+    action: (element.form || element.closest('form'))?.getAttribute('action') || '',
+    hasForm: Boolean(element.form || element.closest('form')),
   };
+}
+
+function inspectWorkspaceControl(element) {
+  const visible = (item) => {
+    const rect = item.getBoundingClientRect();
+    const style = window.getComputedStyle(item);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const form = element.form || element.closest('form');
+  const label = [...(element.labels || [])].map((item) => item.innerText || '').join(' ')
+    || element.getAttribute('aria-label') || element.innerText || '';
+  const radio = element.tagName === 'INPUT' && element.type === 'radio';
+  const value = element.name === 'workspace_id' ? element.value
+    : element.dataset.workspaceId || element.dataset.value || element.getAttribute('value') || '';
+  const formValues = form ? [...form.querySelectorAll('[name="workspace_id"]')]
+    .filter((item) => !item.disabled && (item.type !== 'radio' || item.checked)
+      && item.tagName !== 'BUTTON' && item.type !== 'submit').map((item) => item.value) : [];
+  return {
+    visible: visible(element) || (radio && [...(element.labels || [])].some(visible)),
+    clickLabel: radio && !visible(element),
+    disabled: Boolean(element.disabled || element.getAttribute('aria-disabled') === 'true'),
+    value, label: label.slice(0, 300),
+    kind: element.dataset.kind || element.dataset.workspaceType || element.dataset.type || '',
+    action: form?.getAttribute('action') || '', hasForm: Boolean(form),
+    controlType: element.tagName === 'SELECT' ? 'select' : radio ? 'radio' : 'choice',
+    directSubmit: element.tagName === 'BUTTON' && element.name === 'workspace_id'
+      && element.type === 'submit' && Boolean(form),
+    selected: radio ? element.checked : element.tagName === 'SELECT' ? Boolean(value)
+      : element.getAttribute('aria-checked') === 'true' || element.getAttribute('aria-selected') === 'true'
+        || (formValues.length === 1 && formValues[0] === value),
+    formValues,
+    options: element.tagName === 'SELECT' ? [...element.options].filter((option) => !option.disabled).map((option) => ({
+      value: option.value, label: option.textContent || '',
+      kind: option.dataset.kind || option.dataset.workspaceType || option.dataset.type || '',
+    })) : null,
+  };
+}
+
+async function workspaceControls(page) {
+  const entries = [];
+  for (const handle of await page.$$(SELECTORS.workspace)) {
+    const info = await handle.evaluate(inspectWorkspaceControl);
+    if (!info.visible || info.disabled) continue;
+    if (info.options) entries.push(...info.options.filter((option) => option.value).map((option) => ({ ...info, ...option, handle })));
+    else if (info.value) entries.push({ ...info, handle });
+  }
+  return entries;
+}
+
+function inspectWorkspaceFormSelection(expectedValue) {
+  const fields = [...document.querySelectorAll('input[name="workspace_id"], select[name="workspace_id"]')]
+    .filter((element) => !element.disabled && element.form
+      && element.type !== 'submit' && (element.type !== 'radio' || element.checked));
+  return fields.length === 1 && fields[0].value === expectedValue;
+}
+
+async function workspaceSelectionConfirmed(page, selected) {
+  const actual = await selected.handle.evaluate(inspectWorkspaceControl);
+  if (actual.selected && actual.value === selected.value
+    && !actual.formValues?.some((value) => value !== selected.value)) return true;
+  // A custom dropdown may remove its option from the DOM after clicking it.
+  // Its controlled, form-associated workspace field remains authoritative.
+  return selected.controlType === 'choice'
+    && page.evaluate(inspectWorkspaceFormSelection, selected.value);
+}
+
+async function submitWorkspace(page, selected, beforeSubmit, deadline) {
+  assertAuthPage(page.url());
+  if (selected.hasForm) assertControlAction(selected, page.url());
+  const fresh = await selected.handle.evaluate(inspectWorkspaceControl);
+  if (!fresh.visible || fresh.disabled || (fresh.controlType !== 'select' && fresh.value !== selected.value)) {
+    throw new BrowserOAuthError('browser_oauth_workspace_unconfirmed');
+  }
+  if (fresh.directSubmit) {
+    assertControlAction(fresh, page.url());
+    if (fresh.formValues?.some((value) => value !== selected.value)) {
+      throw new BrowserOAuthError('browser_oauth_workspace_unconfirmed');
+    }
+    beforeSubmit();
+    await selected.handle.click();
+    return;
+  }
+  if (fresh.controlType === 'select') {
+    await selected.handle.select(selected.value);
+  } else if (fresh.clickLabel) {
+    const label = await selected.handle.evaluateHandle((element) => [...(element.labels || [])].find((item) => {
+      const rect = item.getBoundingClientRect();
+      const style = window.getComputedStyle(item);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    }));
+    try {
+      const clickable = label.asElement();
+      if (!clickable) throw new BrowserOAuthError('browser_oauth_control_unavailable');
+      await clickable.click();
+    } finally { await label.dispose(); }
+  } else {
+    await selected.handle.click();
+  }
+  assertAuthPage(page.url());
+  // Read back the actual submitted field, including controlled React inputs.
+  // Clicking a label alone is not proof that the target workspace was selected.
+  let confirmed = await workspaceSelectionConfirmed(page, selected);
+  const selectionDeadline = Math.min(deadline, Date.now() + 1500);
+  while (!confirmed && Date.now() < selectionDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, selectionDeadline - Date.now()))));
+    assertAuthPage(page.url());
+    confirmed = await workspaceSelectionConfirmed(page, selected);
+  }
+  if (!confirmed) {
+    throw new BrowserOAuthError('browser_oauth_workspace_unconfirmed');
+  }
+  const safety = await page.evaluate(inspectPageSafety);
+  if (safety.challenge) throw new BrowserOAuthError('browser_oauth_verification_required');
+  const buttons = await controls(page, SELECTORS.submit);
+  const submitButtons = buttons.filter((button) => !button.value);
+  if (submitButtons.length !== 1) throw new BrowserOAuthError('browser_oauth_control_unavailable');
+  assertControlAction(submitButtons[0], page.url());
+  // Re-read immediately before clicking Continue: a stale personal default
+  // must never be accepted as confirmation of a Team authorization.
+  if (!await workspaceSelectionConfirmed(page, selected)) {
+    throw new BrowserOAuthError('browser_oauth_workspace_unconfirmed');
+  }
+  beforeSubmit();
+  await submitButtons[0].handle.click();
 }
 
 async function controls(page, selector) {
@@ -233,6 +412,7 @@ export async function completeBrowserOAuth({
   let timeout;
   let cancelled = false;
   let completed = false;
+  let navigating = false;
   const progress = (phase, message) => { try { onProgress(phase, message); } catch { /* Progress cannot alter the login flow. */ } };
   const execute = async () => {
     let page;
@@ -293,7 +473,7 @@ export async function completeBrowserOAuth({
         }
         await request.continue();
       } catch (error) {
-        failure = error instanceof BrowserOAuthError ? error : new BrowserOAuthError('browser_oauth_failed');
+        failure ||= classifyBrowserFailure(error);
         await request.abort().catch(() => {});
       }
     });
@@ -314,12 +494,24 @@ export async function completeBrowserOAuth({
         failure = new BrowserOAuthError('browser_oauth_verification_required', { status: 403 });
       }
     });
+    progress('browser_navigation', '浏览器已连接，正在通过当前网络打开官方授权页面');
+    navigating = true;
     try {
       await page.goto(validated.authorization.toString(), { waitUntil: 'domcontentloaded', timeout: Math.max(1, deadline - Date.now()) });
-    } catch {
-      if (!callbackUrl && !failure) throw new BrowserOAuthError('browser_oauth_failed');
-    }
+    } catch (error) {
+      if (!callbackUrl && !failure) {
+        // A redirect can replace the document while goto is waiting. Continue
+        // only on a recognized official page; real network errors still stop.
+        if (!/net::ERR_ABORTED|Execution context was destroyed/i.test(String(error?.message || ''))) {
+          throw classifyBrowserFailure(error, { navigation: true });
+        }
+        assertAuthPage(page.url());
+      }
+    } finally { navigating = false; }
     const submitted = new Set();
+    let workspaceWaitStarted = 0;
+    let workspaceDropdownOpened = false;
+    const workspaceWaitMs = Math.min(10000, Math.max(250, limit / 4));
     for (let step = 0; step < MAX_STEPS && Date.now() < deadline && !cancelled; step += 1) {
       if (failure) throw failure;
       if (callbackUrl) {
@@ -327,18 +519,34 @@ export async function completeBrowserOAuth({
         return { callbackUrl };
       }
       const current = assertAuthPage(page.url());
-      const safety = await page.evaluate(inspectPageSafety);
+      let safety;
+      let emailFields;
+      let passwordFields;
+      let otpFields;
+      let workspaceFields;
+      try {
+        safety = await page.evaluate(inspectPageSafety);
+        emailFields = await controls(page, SELECTORS.email);
+        passwordFields = await controls(page, SELECTORS.password);
+        otpFields = await controls(page, SELECTORS.totp);
+        workspaceFields = await workspaceControls(page);
+      } catch (error) {
+        if (!/Execution context was destroyed|Cannot find context with specified id|detached (?:frame|Frame)/i.test(String(error?.message || ''))) throw error;
+        // Navigation invalidates DOM handles briefly. Re-read the next known
+        // page before interacting; never retry a credential submission here.
+        await new Promise((resolve) => setTimeout(resolve, Math.min(150, Math.max(1, deadline - Date.now()))));
+        continue;
+      }
       if (safety.challenge) throw new BrowserOAuthError('browser_oauth_verification_required');
       if (safety.rejected) {
         const error = new BrowserOAuthError('browser_oauth_credentials_rejected', { browserRequired: false });
         if (safety.passwordRejected) error.reason = 'password_invalid';
         throw error;
       }
-      const emailFields = await controls(page, SELECTORS.email);
-      const passwordFields = await controls(page, SELECTORS.password);
-      const otpFields = await controls(page, SELECTORS.totp);
-      const workspaceFields = await controls(page, SELECTORS.workspace);
-      const stage = passwordFields.length ? 'password' : emailFields.length ? 'email' : otpFields.length ? 'totp' : workspaceFields.length ? 'workspace' : '';
+      if (page.url() !== current.toString()) continue;
+      const workspacePage = /^\/(?:workspace|sign-in-with-chatgpt\/codex\/consent)\/?$/.test(current.pathname);
+      const stage = passwordFields.length ? 'password' : emailFields.length ? 'email' : otpFields.length ? 'totp'
+        : workspaceFields.length || workspacePage ? 'workspace' : '';
       const submissionKey = `${current.pathname}:${stage}`;
       if (stage && !submitted.has(submissionKey)) {
         const entries = { email: emailFields, password: passwordFields, totp: otpFields, workspace: workspaceFields }[stage];
@@ -364,9 +572,31 @@ export async function completeBrowserOAuth({
           progress('browser_totp', '提交账号的当前六位 2FA 验证码');
           await submit(page, entries[0], String(code));
         } else {
-          const selected = selectBrowserWorkspace(entries, String(workspaceId), workspaceMode);
-          progress('browser_workspace', workspaceMode === 'team' ? '选择与目标 Team ID 完全匹配的工作空间' : '选择个人工作空间');
-          await submit(page, selected, null, () => { workspaceSelected = true; });
+          if (!workspacePage) throw new BrowserOAuthError('browser_oauth_page_unsupported');
+          let selected;
+          try { selected = selectBrowserWorkspace(entries, String(workspaceId), workspaceMode); }
+          catch (error) {
+            if (error?.code !== 'browser_oauth_workspace_unavailable') throw error;
+            if (!workspaceWaitStarted) {
+              workspaceWaitStarted = Date.now();
+              progress('browser_workspace_wait', '正在等待目标工作空间列表加载，不会选择个人空间或其他 Team');
+            }
+            if (!workspaceDropdownOpened) {
+              const dropdowns = await controls(page, SELECTORS.workspaceDropdown);
+              if (dropdowns.length === 1) {
+                if (dropdowns[0].hasForm) assertControlAction(dropdowns[0], page.url());
+                await dropdowns[0].handle.click();
+                workspaceDropdownOpened = true;
+              }
+            }
+            if (Date.now() - workspaceWaitStarted >= workspaceWaitMs) throw error;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+            continue;
+          }
+          progress('browser_workspace', workspaceMode === 'team' ? '选择与目标 Team ID 完全匹配的工作空间，并核对实际选中值' : '选择个人工作空间');
+          await submitWorkspace(page, selected, () => { workspaceSelected = true; }, deadline);
+          workspaceWaitStarted = 0;
+          workspaceDropdownOpened = false;
         }
         submitted.add(submissionKey);
       }
@@ -381,14 +611,20 @@ export async function completeBrowserOAuth({
       new Promise((_, reject) => {
         timeout = setTimeout(() => {
           cancelled = true;
-          reject(new BrowserOAuthError('browser_oauth_timeout', { status: 408 }));
+          reject(new BrowserOAuthError(navigating ? 'browser_oauth_navigation_timeout' : 'browser_oauth_timeout', navigating
+            ? { status: 504, browserRequired: false, needsInput: false } : { status: 408 }));
         }, limit);
       }),
     ]);
     completed = true;
     return result;
   } catch (error) {
-    throw error instanceof BrowserOAuthError || error instanceof RoxyBrowserError ? error : new BrowserOAuthError('browser_oauth_failed');
+    const classified = classifyBrowserFailure(error);
+    if (['browser_oauth_proxy_connection_failed', 'browser_oauth_network_failed', 'browser_oauth_browser_disconnected',
+      'browser_oauth_navigation_timeout', 'browser_oauth_failed'].includes(classified.code)) {
+      progress(classified.code, classified.message);
+    }
+    throw classified;
   } finally {
     cancelled = true;
     clearTimeout(timeout);

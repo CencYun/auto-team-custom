@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const serverScript = fileURLToPath(new URL('./index.mjs', import.meta.url));
+const roxyModule = new URL('./roxy-browser.mjs', import.meta.url).href;
 const workspaceId = 'refill-browser-team-workspace';
 const motherId = 'refill-browser-team-mother';
 const childId = 'refill-browser-team-child';
@@ -40,6 +41,9 @@ async function unusedPort() {
 
 async function fixture(t, { teamAuthSessions = {}, teamLoginStates = {}, browserChallenge = true, noMfa = false } = {}) {
   const requests = [];
+  const roxyProfiles = new Map([['fixture-child-profile', { dirId: 'fixture-child-profile', windowRemark: `auto-team:child:${childId}` }]]);
+  const openRoxyProfiles = new Set();
+  let roxySequence = 0;
   const grants = [];
   const browserSessions = new Map();
   const freeToken = token(childEmail, childId, 'refill-browser-personal-workspace', 'free');
@@ -54,6 +58,43 @@ async function fixture(t, { teamAuthSessions = {}, teamLoginStates = {}, browser
     for await (const chunk of req) raw += chunk;
     const entry = { method: req.method, path: url.pathname, browserMode: req.headers['x-fixture-browser-mode'] || '' };
     requests.push(entry);
+    if (url.pathname.startsWith('/browser/')) {
+      assert.equal(req.headers.token, 'fixture-private-roxy');
+      const body = raw ? JSON.parse(raw) : null;
+      let data = {};
+      if (req.method === 'GET' && url.pathname === '/browser/list_v3') {
+        data = { rows: [...roxyProfiles.values()], total: roxyProfiles.size };
+      } else if (req.method === 'POST' && url.pathname === '/browser/create') {
+        assert.equal(body.workspaceId, 'fixture-roxy-workspace');
+        const profile = { dirId: `fixture-roxy-${++roxySequence}`, windowRemark: body.windowRemark, windowName: body.windowName };
+        roxyProfiles.set(profile.dirId, profile);
+        data = { dirId: profile.dirId };
+      } else if (req.method === 'GET' && url.pathname === '/browser/connection_info') {
+        const dirId = url.searchParams.get('dirIds');
+        data = openRoxyProfiles.has(dirId) ? [{ dirId }] : [];
+      } else if (req.method === 'POST' && url.pathname === '/browser/open') {
+        assert.ok(roxyProfiles.has(body.dirId));
+        assert.equal(openRoxyProfiles.has(body.dirId), false);
+        openRoxyProfiles.add(body.dirId);
+        data = { ws: `ws://127.0.0.1:${upstream.address().port}/devtools/browser/${body.dirId}` };
+      } else if (req.method === 'POST' && url.pathname === '/browser/close') {
+        assert.equal(openRoxyProfiles.delete(body.dirId), true);
+      } else if (req.method === 'POST' && url.pathname === '/browser/delete') {
+        assert.equal(body.isSoftDelete, true);
+        for (const dirId of body.dirIds) {
+          assert.equal(openRoxyProfiles.has(dirId), false);
+          assert.equal(roxyProfiles.delete(dirId), true);
+        }
+      } else {
+        entry.unexpected = true;
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ code: 1, msg: 'unexpected_fixture_roxy_request' }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, data }));
+      return;
+    }
     if (url.pathname === '/mock-auth/oauth/authorize') {
       entry.state = url.searchParams.get('state');
       browserSessions.set(entry.state, { redirectUri: url.searchParams.get('redirect_uri') });
@@ -106,7 +147,7 @@ async function fixture(t, { teamAuthSessions = {}, teamLoginStates = {}, browser
   await writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
     version: 1,
     settings: { autoRefill: false, promoteJoinedAccounts: false, joinMode: 'invite', concurrency: 1, kickOnExhausted: false,
-      integrations: { roxy: { enabled: true, baseUrl: 'http://127.0.0.1:50000', apiKey: 'fixture-private-roxy', workspaceId: 'fixture-roxy-workspace', profiles: [{ childId, dirId: 'fixture-child-profile' }] } },
+      integrations: { roxy: { enabled: true, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiKey: 'fixture-private-roxy', workspaceId: 'fixture-roxy-workspace', profiles: [{ childId, dirId: 'fixture-child-profile' }] } },
     },
     mothers: [{ id: motherId, team: workspaceId, accountId: workspaceId, email: 'refill-owner@example.test', primaryOwnerEmail: 'refill-owner@example.test', rotationMode: 'fixed', accessToken: token('refill-owner@example.test', 'refill-owner-user', workspaceId, 'team') }],
     children: [{
@@ -119,8 +160,11 @@ async function fixture(t, { teamAuthSessions = {}, teamLoginStates = {}, browser
     }],
     history: [],
   }));
+  // Keep the real Roxy adapter and lifecycle; replace only browser I/O.
   const browserFixture = `
     export async function completeBrowserOAuth(options) {
+      const session = await options.acquireSession({ timeoutMs: 1000 });
+      try {
       const authorization = new URL(options.authUrl);
       if (authorization.origin !== 'https://auth.openai.com' || authorization.pathname !== '/oauth/authorize'
         || authorization.searchParams.get('state') !== options.expectedState
@@ -135,20 +179,34 @@ async function fixture(t, { teamAuthSessions = {}, teamLoginStates = {}, browser
       if (${JSON.stringify(browserChallenge)}) throw Object.assign(new Error('登录需要完成官方安全验证'), { code: 'browser_verification_required', status: 202, browserRequired: true, needsInput: true });
       const selected = await fetch('https://auth.openai.com/browser/workspace/select', { method: 'POST', headers, body: JSON.stringify({ state: options.expectedState, workspaceId: options.workspaceId }) });
       return selected.json();
+      } finally { await session.close({ keepOpen: false }); }
     }
   `;
   const preload = `
     import { registerHooks } from 'node:module';
-    registerHooks({ load(url, context, nextLoad) {
+    registerHooks({ resolve(specifier, context, nextResolve) {
+      if (specifier === './roxy-browser.mjs') return { url: 'fixture:refill-roxy-session', shortCircuit: true };
+      return nextResolve(specifier, context);
+    }, load(url, context, nextLoad) {
+      if (url === 'fixture:refill-roxy-session') return { format: 'module', shortCircuit: true, source: ${JSON.stringify(`
+        export * from ${JSON.stringify(roxyModule)};
+        import { openRoxyBrowserSession as actualOpen } from ${JSON.stringify(roxyModule)};
+        export function openRoxyBrowserSession(options) {
+          return actualOpen(options, { connect: async () => ({
+            newPage: async () => ({ close: async () => {} }),
+            createBrowserContext: async () => ({ newPage: async () => ({ close: async () => {} }), close: async () => {} }),
+            disconnect: async () => {},
+          }) });
+        }
+      `)} };
       if (url.endsWith('/openai-browser-login.mjs')) return { format: 'module', shortCircuit: true, source: ${JSON.stringify(browserFixture)} };
       return nextLoad(url, context);
     } });
     const nativeFetch = globalThis.fetch;
     globalThis.fetch = async (input, options) => {
       const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
-      if (url.port === '50000') throw new Error('isolated_test_roxy_api_disabled');
       if (url.hostname === 'auth.openai.com') return nativeFetch(${JSON.stringify(`http://127.0.0.1:${upstreamPort}/mock-auth`)} + url.pathname + url.search, options);
-      if (url.hostname !== '127.0.0.1') throw new Error('isolated_external_network_disabled');
+      if (url.hostname !== '127.0.0.1' || Number(url.port) !== ${upstreamPort}) throw new Error('isolated_external_network_disabled');
       return nativeFetch(input, options);
     };
   `;
@@ -166,6 +224,11 @@ async function fixture(t, { teamAuthSessions = {}, teamLoginStates = {}, browser
     upstream.closeAllConnections?.();
     await new Promise((resolve) => upstream.close(resolve));
     await rm(dataDir, { recursive: true, force: true });
+    assert.equal(openRoxyProfiles.size, 0, 'every fixture Roxy session must close');
+    const browserStarts = requests.filter((entry) => entry.path === '/mock-auth/oauth/authorize' && entry.browserMode).length;
+    assert.equal(requests.filter((entry) => entry.path === '/browser/open').length, browserStarts, 'each browser OAuth flow acquires a Roxy session');
+    assert.equal(requests.filter((entry) => entry.path === '/browser/close').length, browserStarts, 'successful and challenged browser flows close their Roxy sessions');
+    assert.equal(requests.some((entry) => entry.unexpected), false);
   });
   const baseUrl = `http://127.0.0.1:${port}`;
   for (let attempt = 0; attempt < 100; attempt += 1) {

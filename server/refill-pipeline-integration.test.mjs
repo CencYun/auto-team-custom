@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const serverScript = fileURLToPath(new URL('./index.mjs', import.meta.url));
+const roxyModule = new URL('./roxy-browser.mjs', import.meta.url).href;
 const workspaceId = 'refill-pipeline-team';
 const personalId = 'refill-pipeline-personal';
 const motherId = 'refill-pipeline-mother';
@@ -58,6 +59,9 @@ async function fixture(t, { browserChallenge = false, teamBrowserChallenge = fal
   const freeToken = token(personalId, childEmail, 'free');
   const teamToken = token(workspaceId, childEmail, 'self_serve_business_prolite');
   const requests = [];
+  const roxyProfiles = new Map();
+  const openRoxyProfiles = new Set();
+  let roxySequence = 0;
   const authSessions = new Map();
   const members = [{ id: 'fixture-owner-user', email: ownerEmail, role: 'account-owner', seat_type: 'default' }];
   if (existingMemberCallback) members.push({ id: 'fixture-member-user', email: childEmail, role: 'standard-user', seat_type: 'default' });
@@ -101,6 +105,42 @@ async function fixture(t, { browserChallenge = false, teamBrowserChallenge = fal
     const claims = requestClaims(req);
     const entry = { method: req.method, path: url.pathname, identity: claims.sub || '', tokenAccountId: claims['https://api.openai.com/auth']?.chatgpt_account_id || '', accountId: req.headers['chatgpt-account-id'] || '', browserMode: req.headers['x-fixture-browser-mode'] || '' };
     requests.push(entry);
+    if (url.pathname.startsWith('/browser/')) {
+      assert.equal(req.headers.token, 'fixture-private-roxy');
+      let data = {};
+      if (req.method === 'GET' && url.pathname === '/browser/list_v3') {
+        data = { rows: [...roxyProfiles.values()], total: roxyProfiles.size };
+      } else if (req.method === 'POST' && url.pathname === '/browser/create') {
+        assert.equal(body.workspaceId, 'fixture-roxy-workspace');
+        const profile = { dirId: `fixture-roxy-${++roxySequence}`, windowRemark: body.windowRemark, windowName: body.windowName };
+        roxyProfiles.set(profile.dirId, profile);
+        data = { dirId: profile.dirId };
+      } else if (req.method === 'GET' && url.pathname === '/browser/connection_info') {
+        const dirId = url.searchParams.get('dirIds');
+        data = openRoxyProfiles.has(dirId) ? [{ dirId }] : [];
+      } else if (req.method === 'POST' && url.pathname === '/browser/open') {
+        assert.ok(roxyProfiles.has(body.dirId));
+        assert.equal(openRoxyProfiles.has(body.dirId), false);
+        openRoxyProfiles.add(body.dirId);
+        data = { ws: `ws://127.0.0.1:${upstream.address().port}/devtools/browser/${body.dirId}` };
+      } else if (req.method === 'POST' && url.pathname === '/browser/close') {
+        assert.equal(openRoxyProfiles.delete(body.dirId), true);
+      } else if (req.method === 'POST' && url.pathname === '/browser/delete') {
+        assert.equal(body.isSoftDelete, true);
+        for (const dirId of body.dirIds) {
+          assert.equal(openRoxyProfiles.has(dirId), false);
+          assert.equal(roxyProfiles.delete(dirId), true);
+        }
+      } else {
+        entry.unexpected = true;
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ code: 1, msg: 'unexpected_fixture_roxy_request' }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, data }));
+      return;
+    }
     const sessionState = String(req.headers.cookie || '').match(/(?:^|;\s*)fixture_oauth_state=([^;]+)/)?.[1] || '';
     const session = authSessions.get(sessionState);
     let status = 200;
@@ -209,11 +249,15 @@ async function fixture(t, { browserChallenge = false, teamBrowserChallenge = fal
     assert.equal(path.dirname(path.resolve(dataDir)), dataRoot);
     assert.match(path.basename(dataDir), /^refill-pipeline-integration-/);
     await rm(dataDir, { recursive: true, force: true });
+    assert.equal(openRoxyProfiles.size, 0, 'every fixture Roxy session must close');
+    const browserStarts = requests.filter((entry) => entry.path === '/mock-auth/oauth/authorize' && entry.browserMode).length;
+    assert.equal(requests.filter((entry) => entry.path === '/browser/open').length, browserStarts, 'each browser OAuth flow acquires a Roxy session');
+    assert.equal(requests.filter((entry) => entry.path === '/browser/close').length, browserStarts, 'successful and challenged browser flows close their Roxy sessions');
   });
   await writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
     version: 1,
     settings: { autoRefill: false, promoteJoinedAccounts: false, delayedKickEnabled: false, concurrency: 2, joinMode: 'invite', inviteSeatType: 'default',
-      ...(roxyEnabled ? { integrations: { roxy: { enabled: true, baseUrl: 'http://127.0.0.1:50000', apiKey: 'fixture-private-roxy', workspaceId: 'fixture-roxy-workspace', profiles: [] } } } : {}),
+      ...(roxyEnabled ? { integrations: { roxy: { enabled: true, baseUrl: `http://127.0.0.1:${upstreamPort}`, apiKey: 'fixture-private-roxy', workspaceId: 'fixture-roxy-workspace', profiles: [] } } } : {}),
     },
     mothers: [{ id: motherId, team: workspaceId, accountId: workspaceId, teamName: 'Refill Pipeline Fixture', email: ownerEmail, primaryOwnerEmail: ownerEmail, accessToken: ownerToken, defaultSeatType: 'default', members: [] }],
     children: [child],
@@ -222,10 +266,12 @@ async function fixture(t, { browserChallenge = false, teamBrowserChallenge = fal
   const port = await unusedPort();
   const callbackPort = teamBrowserChallenge ? await unusedPort() : null;
   const baseUrl = `http://127.0.0.1:${port}`;
-  // Only the UI driver is replaced. The normal callback exchange, identity
-  // checks, invitation, membership confirmation, and quota requests run intact.
+  // Replace only browser I/O. Roxy profile/session lifecycle, callback exchange,
+  // identity checks, invitation, membership confirmation, and quota run intact.
   const browserFixture = `
     export async function completeBrowserOAuth(options) {
+      const session = await options.acquireSession({ timeoutMs: 1000 });
+      try {
       const authorization = new URL(options.authUrl);
       if (authorization.origin !== 'https://auth.openai.com' || authorization.pathname !== '/oauth/authorize'
         || authorization.searchParams.get('state') !== options.expectedState
@@ -245,11 +291,26 @@ async function fixture(t, { browserChallenge = false, teamBrowserChallenge = fal
       options.onProgress?.('browser_workspace', '正在选择目标工作空间');
       const selected = await request('/api/accounts/workspace/select', { workspace_id: options.workspaceMode === 'team' ? options.workspaceId : ${JSON.stringify(personalId)} });
       return { callbackUrl: (await selected.json()).continue_url };
+      } finally { await session.close({ keepOpen: false }); }
     }
   `;
   const preload = `
     import { registerHooks } from 'node:module';
-    registerHooks({ load(url, context, nextLoad) {
+    registerHooks({ resolve(specifier, context, nextResolve) {
+      if (specifier === './roxy-browser.mjs') return { url: 'fixture:refill-roxy-session', shortCircuit: true };
+      return nextResolve(specifier, context);
+    }, load(url, context, nextLoad) {
+      if (url === 'fixture:refill-roxy-session') return { format: 'module', shortCircuit: true, source: ${JSON.stringify(`
+        export * from ${JSON.stringify(roxyModule)};
+        import { openRoxyBrowserSession as actualOpen } from ${JSON.stringify(roxyModule)};
+        export function openRoxyBrowserSession(options) {
+          return actualOpen(options, { connect: async () => ({
+            newPage: async () => ({ close: async () => {} }),
+            createBrowserContext: async () => ({ newPage: async () => ({ close: async () => {} }), close: async () => {} }),
+            disconnect: async () => {},
+          }) });
+        }
+      `)} };
       if (url.endsWith('/openai-browser-login.mjs')) return { format: 'module', shortCircuit: true, source: ${JSON.stringify(browserFixture)} };
       if (url.endsWith('/openai-sentinel.mjs')) return { format: 'module', shortCircuit: true, source: 'export async function fetchSentinelToken() { return "fixture-sentinel-only"; }' };
       return nextLoad(url, context);
@@ -257,10 +318,9 @@ async function fixture(t, { browserChallenge = false, teamBrowserChallenge = fal
     const nativeFetch = globalThis.fetch;
     globalThis.fetch = async (input, options) => {
       const url = new URL(typeof input === 'string' || input instanceof URL ? String(input) : input.url);
-      if (url.port === '50000') throw new Error('isolated_test_roxy_api_disabled');
       if (url.hostname === 'auth.openai.com') return nativeFetch(${JSON.stringify(`http://127.0.0.1:${upstreamPort}/mock-auth`)} + url.pathname + url.search, options);
       if (url.hostname === 'sentinel.openai.com') return nativeFetch(${JSON.stringify(`http://127.0.0.1:${upstreamPort}/mock-sentinel`)} + url.pathname + url.search, options);
-      if (url.hostname !== '127.0.0.1') throw new Error('isolated_test_external_network_disabled');
+      if (url.hostname !== '127.0.0.1' || Number(url.port) !== ${upstreamPort}) throw new Error('isolated_test_external_network_disabled');
       return nativeFetch(input, options);
     };
   `;

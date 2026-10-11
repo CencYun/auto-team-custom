@@ -1248,6 +1248,35 @@ test('external provider failure falls back to a fresh browser PKCE flow with the
   assert.equal(providerExchanges, 0);
 });
 
+test('single-attempt Roxy may recover a disconnected link provider before its only browser login', async () => {
+  let browserCalls = 0;
+  let providerCalls = 0;
+  const phases = [];
+  const result = await loginFreeAccount({
+    singleAttempt: true, allowLocalAuthorizationFallback: true, browserLogin: true,
+    email: 'fixture@example.test', password: 'fixture-password', workspaceMode: 'team', workspaceId: 'target-team',
+    authorizationProvider: async () => { providerCalls += 1; throw Object.assign(new Error('fixture reset'), { code: 'ECONNRESET' }); },
+    callbackHandler: async () => { assert.fail('local callback cannot use the failed remote provider'); },
+    browserOAuth: async (options) => {
+      browserCalls += 1;
+      assert.equal(options.workspaceMode, 'team');
+      assert.equal(options.workspaceId, 'target-team');
+      assert.ok(new URL(options.authUrl).searchParams.get('code_challenge'));
+      return { callbackUrl: `http://localhost:1455/auth/callback?code=fixture-local-code&state=${options.expectedState}` };
+    },
+    fetch: async (url) => {
+      assert.equal(new URL(url).pathname, '/oauth/token');
+      return jsonResponse({ access_token: 'fixture-local-access', refresh_token: 'fixture-local-refresh' });
+    },
+    onProgress: (phase) => phases.push(phase),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(browserCalls, 1);
+  assert.equal(providerCalls, 1);
+  assert.equal(result.oauthFallback.code, 'ECONNRESET');
+  assert.ok(phases.includes('oauth_local_fallback'));
+});
+
 test('single-attempt batch login stops at provider failure without starting fallback authorization', async () => {
   let providerCalls = 0;
   let browserCalls = 0;

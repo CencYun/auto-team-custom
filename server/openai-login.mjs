@@ -1108,10 +1108,18 @@ export async function loginFreeAccount(options = {}) {
         };
       }
     }
+    const providerTransportFailure = runner.phase === 'oauth_link'
+      && /^(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET)$/.test(String(error?.code || ''));
     const providerFailure = Boolean(options.authorizationProvider)
       && (/^sub2api_oauth_/i.test(String(error?.code || ''))
-        || /^oauth_provider_/i.test(String(error?.code || '')));
-    if (options.singleAttempt !== true && providerFailure && !runner.session.callbackUrl && !options.callbackUrl) {
+        || /^oauth_provider_/i.test(String(error?.code || '')) || providerTransportFailure);
+    const localEntryFallback = options.allowLocalAuthorizationFallback === true && options.browserLogin === true
+      && runner.phase === 'oauth_link' && !runner.session.authorization
+      && (providerTransportFailure || Number(error?.status) >= 500);
+    if ((options.singleAttempt !== true || localEntryFallback) && providerFailure && !runner.session.callbackUrl && !options.callbackUrl) {
+      // An unavailable link provider precedes the first browser login. Use
+      // local PKCE once without retrying a submitted login or existing code.
+      runner.progress('oauth_local_fallback', '授权链接服务暂不可用，改用本机 OAuth 入口继续本次登录');
       oauthFallback = {
         code: error?.code || 'oauth_provider_failed',
         message: error?.message || '外部 OAuth 服务不可用',

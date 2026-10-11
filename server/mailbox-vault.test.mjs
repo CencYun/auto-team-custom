@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createMailboxVaultRecord, exportMailboxVaultRecords, fullMailboxVaultRecord, importMailboxVaultRecords, publicMailboxVaultRecord, selectMailboxVaultRecords, updateMailboxVaultRecord } from './mailbox-vault.mjs';
+import { createMailboxVaultRecord, exportMailboxVaultRecords, fullMailboxVaultRecord, importMailboxVaultRecords, markMailboxVaultRecordsExported, publicMailboxVaultRecord, selectMailboxVaultRecords, updateMailboxVaultRecord } from './mailbox-vault.mjs';
 import { exportMailboxVaultText, parseMailboxVaultText } from '../shared/mailbox-vault-text.mjs';
 
 const firstTime = '2026-10-10T01:00:00.000Z';
@@ -8,13 +8,13 @@ const secondTime = '2026-10-10T02:00:00.000Z';
 const sample = { account: ' Mail@Example.test ', password: '  p----中文,|\t"\\\r\n  ', totp: 'opaque 2fa ---- value' };
 
 test('mailbox metadata stays separate and edits preserve credentials and server identities', () => {
-  const record = createMailboxVaultRecord({ ...sample, id: 'forged', createdAt: 'forged', note: 'ignored' }, [], firstTime);
+  const record = createMailboxVaultRecord({ ...sample, id: 'forged', createdAt: 'forged', note: 'ignored', exportedAt: firstTime }, [], firstTime);
   assert.match(record.id, /^mailbox_vault_/);
   assert.equal(record.account, 'Mail@Example.test');
   assert.equal(record.password, sample.password);
   assert.equal(record.totp, sample.totp);
   assert.equal(record.note, undefined);
-  assert.deepEqual(publicMailboxVaultRecord(record), { id: record.id, account: record.account, hasPassword: true, hasTotp: true, createdAt: firstTime, updatedAt: firstTime });
+  assert.deepEqual(publicMailboxVaultRecord(record), { id: record.id, account: record.account, hasPassword: true, hasTotp: true, createdAt: firstTime, updatedAt: firstTime, exportedAt: null });
   assert.deepEqual(fullMailboxVaultRecord(record), record);
   const updated = updateMailboxVaultRecord(record, { totp: '', id: 'forged' }, [record], secondTime);
   assert.equal(updated.password, sample.password);
@@ -165,4 +165,48 @@ test('export/delete selections are explicit, ordered and reject stale or repeate
   assert.deepEqual(exportMailboxVaultRecords([a, b], [b.id, a.id]).records.map((record) => record.id), [b.id, a.id]);
   for (const ids of [undefined, [], [a.id, a.id], [1], [''], 'all']) assert.throws(() => selectMailboxVaultRecords([a, b], ids), { status: 400 });
   assert.throws(() => selectMailboxVaultRecords([a, b], [a.id, 'missing']), { status: 409 });
+});
+
+test('marking exported mailboxes validates every identity without changing unselected or stale records', () => {
+  const a = createMailboxVaultRecord({ account: 'a@example.test' }, [], firstTime);
+  const b = createMailboxVaultRecord({ account: 'b@example.test' }, [], firstTime);
+  const records = [a, b];
+  const before = structuredClone(records);
+  const selection = [{ id: b.id, account: ' B@EXAMPLE.TEST ' }];
+  const marked = markMailboxVaultRecordsExported(records, selection, secondTime);
+  assert.deepEqual(marked, [{ ...b, exportedAt: secondTime, updatedAt: secondTime }]);
+  assert.deepEqual(records, before);
+  for (const invalid of [undefined, null, [], {}, [null], [[b.id]], [{ id: b.id }],
+    [{ id: b.id, account: 123 }], [{ id: b.id, account: 'invalid' }],
+    [{ account: b.account }], [{ id: 123, account: b.account }],
+    [{ id: b.id, account: b.account }, { id: b.id, account: b.account }]]) {
+    assert.throws(() => markMailboxVaultRecordsExported(records, invalid), { status: 400 });
+  }
+  for (const stale of [
+    [{ id: a.id, account: a.account }, { id: b.id, account: 'changed@example.test' }],
+    [{ id: a.id, account: a.account }, { id: 'deleted', account: b.account }],
+  ]) assert.throws(() => markMailboxVaultRecordsExported(records, stale), { status: 409 });
+  assert.deepEqual(records, before);
+});
+
+test('export markers survive credential edits, clear for new addresses, and never import from caller metadata', () => {
+  const record = createMailboxVaultRecord(sample, [], firstTime);
+  const marked = markMailboxVaultRecordsExported([record], [{ id: record.id, account: record.account }], secondTime)[0];
+  const updated = updateMailboxVaultRecord(marked, { account: 'mail@example.test', password: 'new', totp: 'new2fa', exportedAt: null }, [marked]);
+  assert.equal(updated.exportedAt, secondTime);
+  assert.equal(updateMailboxVaultRecord(updated, { account: 'new@example.test', exportedAt: secondTime }, [updated]).exportedAt, null);
+  const legacy = { ...record };
+  delete legacy.exportedAt;
+  assert.equal(publicMailboxVaultRecord(legacy).exportedAt, null);
+  assert.equal(fullMailboxVaultRecord(legacy).exportedAt, null);
+  assert.equal(updateMailboxVaultRecord(legacy, { password: 'edited' }, [legacy]).exportedAt, null);
+  const exported = exportMailboxVaultRecords([marked], [marked.id]);
+  assert.equal(exported.records[0].exportedAt, secondTime);
+  assert.equal(marked.exportedAt, secondTime);
+  const restored = importMailboxVaultRecords({ text: JSON.stringify(exported) }, []).added[0];
+  assert.equal(restored.exportedAt, null);
+  assert.equal(importMailboxVaultRecords({ records: [marked] }, []).added[0].exportedAt, null);
+  const txtRestored = importMailboxVaultRecords({ text: exportMailboxVaultText(exported.records) }, []).added[0];
+  for (const key of ['account', 'password', 'totp']) assert.equal(txtRestored[key], marked[key]);
+  assert.equal(txtRestored.exportedAt, null);
 });

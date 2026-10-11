@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamInviteCandidateState, teamMemberRemovalState } from '../shared/team-workflow-ui.mjs';
+import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamInviteCandidateState, teamMemberRemovalState, teamAutoJsonCandidates, teamAutoJsonRowTarget } from '../shared/team-workflow-ui.mjs';
 
 const teamId = 'fixture-workspace';
 const mother = { accountId: teamId, email: 'owner@fixture.test' };
@@ -242,4 +242,36 @@ test('Free credentials and unassociated Team metadata cannot create ready author
   assert.equal(workflows.every((workflow) => !workflow.ready), true);
   assert.equal(workflows[0].authorization, null, 'another Team authorization cannot replace invited Team authorization');
   assert.equal(workflows[1].related, false, 'credentials alone cannot prove current membership');
+});
+
+test('automatic batch count excludes successful JSON and keeps only pending target-Team accounts', () => {
+  const pending = { ...account, id: 'pending', teamInvitations: [invitation] };
+  const complete = { ...account, id: 'complete', joinedTeams: [activeMembership], teamAuthorizations: [authorization] };
+  const other = { ...pending, id: 'other', teamInvitations: [{ ...invitation, motherId: 'other-mother', workspaceId: 'other-team' }] };
+  const banned = { ...pending, id: 'banned', banStatus: 'banned' };
+  const accounts = [complete, pending, other, banned, { ...pending }];
+  assert.deepEqual(teamAutoJsonCandidates(accounts, invitationMother).map((item) => item.id), ['pending']);
+  assert.deepEqual(teamAutoJsonCandidates(accounts, null), []);
+});
+
+test('single-row automatic selection never widens an empty, ready, missing or explicit account id to the batch', () => {
+  const first = { ...account, id: 'first', teamInvitations: [invitation] };
+  const second = { ...account, id: 'second', joinedTeams: [activeMembership], teamAuthorizations: [authorization] };
+  const third = { ...first, id: 'third' };
+  const accounts = [first, second, third];
+  assert.deepEqual(teamAutoJsonCandidates(accounts, invitationMother, ['third']).map((item) => item.id), ['third']);
+  for (const ids of [[], ['missing'], ['second']]) assert.deepEqual(teamAutoJsonCandidates(accounts, invitationMother, ids), []);
+  assert.deepEqual(teamAutoJsonCandidates(accounts, invitationMother, ['third', 'third', 'second']).map((item) => item.id), ['third']);
+});
+
+test('row target follows its sole association in overview and never substitutes an explicitly chosen Team', () => {
+  const secondMother = { id: 'mother-second', accountId: 'workspace-second' };
+  const invited = { ...account, teamInvitations: [invitation] };
+  const mothers = [secondMother, invitationMother];
+  assert.equal(teamAutoJsonRowTarget(invited, mothers).mother.id, invitationMother.id);
+  assert.equal(teamAutoJsonRowTarget(invited, mothers, secondMother.id), null);
+  assert.equal(teamAutoJsonRowTarget(invited, mothers, 'deleted-mother'), null);
+  const both = { ...invited, teamInvitations: [invitation, { motherId: secondMother.id, workspaceId: secondMother.accountId, status: 'invited' }] };
+  assert.equal(teamAutoJsonRowTarget(both, mothers), null);
+  assert.equal(teamAutoJsonRowTarget(both, mothers, secondMother.id).mother.id, secondMother.id);
 });
