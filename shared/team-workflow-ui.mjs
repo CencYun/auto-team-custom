@@ -40,23 +40,37 @@ export function teamAuthorizationState(account, workspaceId) {
   const membership = memberships(account).get(target);
   const login = key(account.teamLogin?.workspaceId) === target ? account.teamLogin : null;
   const pendingMembership = membership?.status === 'active' && (
-    ['pending', 'login_required', 'authenticating'].includes(membership.workspaceTokenStatus)
+    ['pending', 'invalid', 'login_required', 'authenticating'].includes(membership.workspaceTokenStatus)
     || ['team_token_failed', 'member_confirmed_token_pending', 'owner_confirmed_token_pending'].includes(membership.joinStatus)
   );
   if (!login && !pendingMembership) return null;
-  const pending = login ? login.status !== 'ready' : true;
-  let authUrl = null;
-  if (pending && login?.browserRequired && login.authUrl && account.status !== 'banned' && account.banStatus !== 'banned') {
-    try {
-      const url = new URL(login.authUrl);
-      if (url.protocol === 'https:' && url.hostname === 'auth.openai.com' && !url.username && !url.password) authUrl = url.toString();
-    } catch { /* An invalid or non-official URL cannot become an authorization action. */ }
-  }
+  const invalid = membership?.workspaceTokenStatus === 'invalid';
+  const pending = invalid || (login ? login.status !== 'ready' : true);
+  const authUrl = pending && login?.browserRequired && account.status !== 'banned' && account.banStatus !== 'banned'
+    ? officialTeamAuthorizationUrl(login.authUrl) : null;
   const status = !pending ? 'ready' : login?.browserRequired ? 'browser_required' : login?.needsInput ? 'waiting_code'
     : ['authenticating', 'initializing', 'workspace', 'oauth_exchange'].includes(login?.status) ? 'authenticating' : login?.code === 'team_auth_retry_backoff' ? 'queued' : 'failed';
   const label = !pending ? 'Team 授权就绪' : login?.browserRequired ? 'Team 授权待验证' : login?.needsInput ? 'Team 授权待输入'
-    : status === 'authenticating' ? 'Team 授权获取中' : status === 'queued' ? 'Team 授权重试冷却' : '已入团 · 待 Team 授权';
+    : status === 'authenticating' ? 'Team 授权获取中' : status === 'queued' ? 'Team 授权重试冷却'
+      : invalid || login?.code === 'team_reauthorization_required' ? 'Team 授权失效 · 需重新授权'
+        : login?.code === 'team_token_refresh_failed' ? '授权刷新失败 · 可重新获取' : '已入团 · 待 Team 授权';
   return { pending, status, label, authUrl, message: login?.message || '', retryAfter: login?.retryAfter || null };
+}
+
+export function officialTeamAuthorizationUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' && url.hostname === 'auth.openai.com' && !url.username && !url.password && (!url.port || url.port === '443')) return url.toString();
+  } catch { /* Only an official HTTPS authorization link can become an action. */ }
+  return null;
+}
+
+// A late response must never supply a link for a different account or Team.
+export function manualTeamAuthorizationUrl(result, target) {
+  if (!result || !target?.id || !target.motherId || !target.workspaceId
+    || result.child?.id !== target.id || key(result.motherId) !== key(target.motherId)
+    || key(result.workspaceId) !== key(target.workspaceId) || result.browserRequired !== true) return null;
+  return officialTeamAuthorizationUrl(result.authUrl);
 }
 
 function targetTeam(mother) {
@@ -83,15 +97,17 @@ export function teamAutoJsonState(account, mother) {
   const invitation = (account?.teamInvitations || []).find((record) => matchesTarget(record, target) && record.status === 'invited');
   const authorization = (account?.teamAuthorizations || []).find((record) => matchesTarget(record, target)) || null;
   const expiresAt = Date.parse(authorization?.expiresAt || '');
-  const ready = Boolean(member && authorization?.ready === true && authorization.hasAccessToken === true
+  const needsReauthorization = Boolean(authorization?.needsReauthorization || membership?.workspaceTokenStatus === 'invalid');
+  const retryAuthorization = Boolean(authorization?.retryAuthorization);
+  const ready = Boolean(member && !needsReauthorization && !retryAuthorization && authorization?.ready === true && authorization.hasAccessToken === true
     && authorization.hasRefreshToken === true && Number.isFinite(expiresAt) && expiresAt > Date.now() + 30_000);
   const rawLogin = authorization?.login && key(authorization.login.workspaceId) === target.workspaceId
     ? authorization.login : null;
-  const login = rawLogin?.status === 'ready' && !ready
-    ? { ...rawLogin, status: 'login_required', code: 'team_json_incomplete', message: member ? 'Team JSON 已失效或不完整，请重新获取' : '尚未确认加入目标 Team，请先完成入团', browserRequired: false, needsInput: false, authUrl: null }
+  const login = !ready && (rawLogin?.status === 'ready' || !rawLogin && (needsReauthorization || retryAuthorization))
+    ? { ...rawLogin, workspaceId: target.workspaceId, status: 'login_required', code: needsReauthorization ? 'team_reauthorization_required' : retryAuthorization ? 'team_token_refresh_failed' : 'team_json_incomplete', message: needsReauthorization ? '目标 Team 授权已失效，请重新授权' : retryAuthorization ? '目标 Team 授权刷新失败，可重新获取；尚未确认凭据失效' : member ? 'Team JSON 已失效或不完整，请重新获取' : '尚未确认加入目标 Team，请先完成入团', browserRequired: false, needsInput: false, authUrl: null }
     : rawLogin;
   const invited = Boolean(invitation);
-  return { workspaceId: target.workspaceId, member, invited, related: member || invited, ready, login, membership, authorization };
+  return { workspaceId: target.workspaceId, member, invited, related: member || invited, ready, needsReauthorization, retryAuthorization, login, membership, authorization };
 }
 
 // An overview keeps each Team's credentials separate and retains historical
