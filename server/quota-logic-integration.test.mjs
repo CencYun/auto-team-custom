@@ -71,6 +71,8 @@ async function startQuotaApp(t, {
   initialState = {},
   refreshResponses = null,
   sessionResponses = {},
+  workspaceResponses = {},
+  roxyEnabled = false,
 }) {
   const requests = [];
   const upstream = createServer(async (req, res) => {
@@ -95,6 +97,11 @@ async function startQuotaApp(t, {
       const mock = refreshResponses?.[request.refreshToken || request.authorizationCode];
       status = mock?.status || 400;
       payload = mock?.payload || { error: 'test_oauth_response_not_configured' };
+    } else if (url.pathname === '/mock-blocked-external') {
+      status = 200;
+    } else if (workspaceResponses[accountId] && ['/backend-api/subscriptions', `/backend-api/accounts/${accountId}/users`].includes(url.pathname)) {
+      status = workspaceResponses[accountId].status;
+      payload = workspaceResponses[accountId].payload;
     } else if (req.method === 'GET' && url.pathname === '/backend-api/subscriptions') {
       payload = { seats_in_use: members.length, seats_entitled: 2, seat_capacity: [{ type: 'default', paid: 2, held: 0 }], assigned: { default: members.length } };
     } else if (req.method === 'GET' && url.pathname === `/backend-api/accounts/${accountId}/users`) {
@@ -123,23 +130,31 @@ async function startQuotaApp(t, {
   const dataDir = await mkdtemp(path.join(dataRoot, 'quota-logic-integration-'));
   const state = {
     version: 1,
+    ...initialState,
     settings: {
       autoRefill: false,
       promoteJoinedAccounts: false,
       delayedKickEnabled: false,
       ...initialState.settings,
+      ...(roxyEnabled ? { integrations: { ...initialState.settings?.integrations, roxy: {
+        enabled: true,
+        baseUrl: `http://127.0.0.1:${upstreamPort}`,
+        apiKey: 'fixture-roxy-api-key',
+        workspaceId: 'fixture-roxy-workspace',
+        profileMode: 'dedicated',
+        useProxyPool: false,
+      } } } : {}),
     },
     mothers: teams,
     children,
     history: [],
-    ...initialState,
   };
   await writeFile(path.join(dataDir, 'state.json'), JSON.stringify(state));
   const port = await unusedPort();
   const baseUrl = `http://127.0.0.1:${port}`;
   let output = '';
   const spawnArgs = [];
-  if (refreshResponses) {
+  if (refreshResponses || roxyEnabled) {
     const preload = `
       const nativeFetch = globalThis.fetch;
       globalThis.fetch = async (input, options) => {
@@ -147,7 +162,10 @@ async function startQuotaApp(t, {
         if (url.hostname === 'auth.openai.com' && ['/api/oauth/oauth2/token', '/oauth/token'].includes(url.pathname)) {
           return nativeFetch(${JSON.stringify(`http://127.0.0.1:${upstreamPort}/mock-oauth/token`)}, options);
         }
-        if (url.hostname !== '127.0.0.1') throw new Error('isolated_test_external_network_disabled');
+        if (url.hostname !== '127.0.0.1') {
+          await nativeFetch(${JSON.stringify(`http://127.0.0.1:${upstreamPort}/mock-blocked-external`)}, { method: 'POST' });
+          throw new Error('isolated_test_external_network_disabled');
+        }
         return nativeFetch(input, options);
       };
     `;
@@ -986,6 +1004,87 @@ test('an expired matching top-level Team token can use its RT to restore its own
   assert.equal(entry?.credentials.refresh_token, 'fake-rotated-team-refresh-token');
   assert.deepEqual(app.requests.filter((request) => request.pathname === '/mock-oauth/token').map((request) => [request.grantType, request.refreshToken]), [['refresh_token', refreshToken]]);
 });
+
+for (const endpoint of ['/api/maintenance/check', '/api/maintenance/check-all']) {
+  test(`${endpoint} queries existing quota without browser or password login when manager and member tokens fail`, { timeout: 25_000 }, async (t) => {
+    const workspace = 'quota-check-no-login-workspace';
+    const ownerEmail = 'owner@quota-check-no-login.test';
+    const cases = ['missing', 'unauthorized', 'rejected-refresh', 'expired-403', 'challenge-403', 'healthy'];
+    const children = cases.map((name) => {
+      const id = `quota-check-${name}`;
+      const account = {
+        ...child(id, `${name}@quota-check-no-login.test`, [{ team: workspace, memberId: id }]),
+        password: 'fixture-account-password',
+        totp: 'JBSWY3DPEHPK3PXP',
+      };
+      if (name === 'missing') account.workspaceTokens = {};
+      if (name === 'rejected-refresh') account.workspaceTokens[workspace].refreshToken = 'fixture-rejected-team-rt';
+      return account;
+    });
+    const mother = {
+      ...team(workspace, ownerEmail, [member('quota-check-owner', ownerEmail, 'account-owner'), ...children.map((account) => member(account.id, account.email))]),
+      password: 'fixture-owner-password',
+      totp: 'JBSWY3DPEHPK3PXP',
+    };
+    const app = await startQuotaApp(t, {
+      teams: [mother],
+      children,
+      roxyEnabled: true,
+      workspaceResponses: { [workspace]: { status: 401, payload: { error: { code: 'token_expired', message: 'owner authorization expired' } } } },
+      usage: {
+        default: { status: 401, payload: { error: { code: 'token_expired', message: 'authorization expired' } } },
+        [usageKey(workspace, 'child:quota-check-expired-403')]: { status: 403, payload: { error: { code: 'token_expired', message: 'authorization token expired' } } },
+        [usageKey(workspace, 'child:quota-check-challenge-403')]: { status: 403, payload: { error: { code: 'cloudflare_challenge', message: 'Cloudflare challenge required' } } },
+        [usageKey(workspace, 'child:quota-check-healthy')]: { payload: { rate_limit: {
+          primary_window: { used_percent: 23, limit_window_seconds: 18000 },
+          secondary_window: { used_percent: 41, limit_window_seconds: 604800 },
+        } } },
+      },
+      refreshResponses: { 'fixture-rejected-team-rt': { status: 400, payload: { error: 'invalid_grant' } } },
+    });
+    assert.equal((await app.publicState()).settings.integrations.roxy.enabled, true, 'the regression requires a configured and enabled browser backend');
+    const response = await app.rawPost(endpoint, { motherId: mother.id });
+    assert.equal(response.status, 200);
+    const result = endpoint.endsWith('/check-all') ? response.data.teams[0] : response.data;
+    assert.equal(result.status, 207, 'unavailable authorization is a partial quota result');
+    assert.equal(result.syncOk, false);
+    assert.equal(result.managerAuthorizationRequired, true, 'manager 401 must direct the user to Free management');
+    assert.equal(result.checked, children.length, 'failed Team management cannot suppress other member quota checks');
+    assert.equal(result.reloggedTeamAccounts, 0);
+    const healthy = result.results.find((entry) => entry.id === 'quota-check-healthy');
+    assert.equal(healthy?.ok, true);
+    assert.equal(healthy.authorizationRequired, false);
+    assert.equal(healthy.quota5h, 77);
+    assert.equal(healthy.quota7d, 59);
+    for (const name of cases.filter((entry) => entry !== 'healthy')) {
+      const probe = result.results.find((entry) => entry.id === `quota-check-${name}`);
+      assert.equal(probe?.ok, false, `${name} retains its authorization failure`);
+      assert.equal(probe.quota5h, null, `${name} must not invent a quota`);
+      assert.equal(probe.quota7d, null);
+      assert.equal(probe.authorizationRequired, name !== 'challenge-403', `${name} distinguishes authorization loss from an unrelated 403`);
+      if (name === 'challenge-403') assert.equal(probe.tokenRecovery, null, 'an upstream challenge cannot require a new Team authorization');
+      else assert.ok(probe.tokenRecovery, `${name} may attempt its existing refresh token`);
+      if (probe.tokenRecovery) {
+        assert.equal(probe.tokenRecovery.credentialLogin, false);
+        assert.equal(probe.tokenRecovery.credentialLoginAttempted, false, `${name} must never start a login`);
+        assert.equal(probe.tokenRecovery.browserRequired, false);
+        assert.equal(probe.tokenRecovery.needsInput, false);
+        assert.match(probe.tokenRecovery.message, /Free 账号管理/, 'unavailable Team authorization points to the explicit login action');
+      }
+    }
+    const saved = await app.persistedState();
+    assert.equal(saved.mothers[0].lastManagerRecoveryAttemptAt ?? null, null, 'manager quota recovery cannot attempt a password login');
+    for (const account of saved.children) {
+      assert.equal(account.teamLoginAttemptedAt ?? null, null, 'quota checks cannot replace the Free management login state');
+      assert.deepEqual(Object.keys(account.teamAuthSessions || {}), [], 'quota checks cannot create an OAuth session');
+    }
+    assert.deepEqual(app.requests.filter((entry) => entry.pathname.startsWith('/browser/')), [], 'Roxy must not receive profile creation, opening, or cleanup requests');
+    assert.deepEqual(app.requests.filter((entry) => entry.pathname === '/mock-blocked-external'), [], 'quota checks cannot attempt a protocol login either');
+    const refreshRequests = app.requests.filter((entry) => entry.pathname === '/mock-oauth/token');
+    assert.ok(refreshRequests.length > 0, 'the existing Team refresh token was attempted');
+    assert.ok(refreshRequests.every((entry) => entry.grantType === 'refresh_token' && entry.refreshToken === 'fixture-rejected-team-rt'));
+  });
+}
 
 test('an explicit same-member Team refresh updates the account and selected workspace credentials together', { timeout: 25_000 }, async (t) => {
   const workspace = 'explicit-refresh-workspace';

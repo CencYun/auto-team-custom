@@ -113,7 +113,7 @@ test('dashboard login gates state and version through an isolated server session
   assert.equal(stillAnonymous.status, 200);
   assert.equal((await stillAnonymous.json()).authenticated, false);
 
-  const login = await jsonPost(baseUrl, '/api/auth/login', { password: 'daixuteam' });
+  const login = await jsonPost(baseUrl, '/api/auth/login', { password: 'xiaoyu' });
   assert.equal(login.status, 200);
   const setCookie = login.headers.get('set-cookie') || '';
   assert.match(setCookie, /^team_rotation_session=[A-Za-z0-9_-]{43};/);
@@ -132,6 +132,7 @@ test('dashboard login gates state and version through an isolated server session
   assert.ok(Array.isArray(state.children));
   assert.ok(Array.isArray(state.mothers));
   assert.equal(Object.hasOwn(state.settings, 'githubRepository'), false);
+  assert.equal(state.settings.autoRefill, false, 'automation stays off until explicitly enabled');
 
   const session = await fetch(`${baseUrl}/api/auth/session`, { headers: { cookie }, signal: AbortSignal.timeout(5000) });
   assert.equal(session.status, 200);
@@ -151,7 +152,7 @@ test('dashboard login gates state and version through an isolated server session
   assert.equal(legacySettings.status, 200);
   assert.equal(Object.hasOwn((await legacySettings.json()).settings, 'githubRepository'), false);
 
-  const forwardedLogin = await jsonPost(baseUrl, '/api/auth/login', { password: 'daixuteam' }, { 'x-forwarded-proto': 'https' });
+  const forwardedLogin = await jsonPost(baseUrl, '/api/auth/login', { password: 'xiaoyu' }, { 'x-forwarded-proto': 'https' });
   assert.equal(forwardedLogin.status, 200);
   assert.match(forwardedLogin.headers.get('set-cookie') || '', /; Secure(?:;|$)/);
 

@@ -33,7 +33,7 @@ function cookieAttributes(req) {
   return `Path=/api; HttpOnly; SameSite=Lax${secureCookie(req) ? '; Secure' : ''}`;
 }
 
-export function createDashboardAuth({ password = 'daixuteam', now = Date.now } = {}) {
+export function createDashboardAuth({ password = 'xiaoyu', now = Date.now } = {}) {
   const expected = createHash('sha256').update(String(password), 'utf8').digest();
   const sessions = new Map();
   const failures = new Map();

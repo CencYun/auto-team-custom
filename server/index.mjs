@@ -34,7 +34,7 @@ const stateFile = path.join(dataDir, 'state.json');
 const port = Number(process.env.PORT || 8786);
 const host = process.env.HOST || '127.0.0.1';
 const apiAuthToken = String(process.env.TEAM_ROTATION_API_TOKEN || '').trim();
-const loginPassword = process.env.TEAM_ROTATION_LOGIN_PASSWORD ?? 'daixuteam';
+const loginPassword = process.env.TEAM_ROTATION_LOGIN_PASSWORD ?? 'xiaoyu';
 const configuredDataKey = String(process.env.TEAM_ROTATION_DATA_KEY || '').trim();
 const CHATGPT_BASE_URL = process.env.CHATGPT_BASE_URL || 'https://chatgpt.com';
 const OPENAI_REQUEST_TIMEOUT_MS = Number(process.env.OPENAI_REQUEST_TIMEOUT_MS || 15000);
@@ -53,7 +53,7 @@ const { version: currentVersion } = JSON.parse(await readFile(path.join(root, 'p
 const emptyState = {
   version: 1,
   settings: {
-    autoRefill: true,
+    autoRefill: false,
     threshold: 10,
     checkInterval: 60,
     kickOnExhausted: true,
@@ -4794,7 +4794,8 @@ function canAutoPushRenewedTeamJson(mother) {
     && (Number.isFinite(groupId) && groupId > 0 || Boolean(String(config.groupName || '').trim()));
 }
 
-async function renewUnauthorizedTeamToken(mother, child, { allowCredentialLogin = false } = {}) {
+// Quota checks may refresh existing Team authorization, but must never log in.
+async function renewUnauthorizedTeamToken(mother, child) {
   if (!mother?.accountId || !child) return { ok: false, status: 400, message: 'workspace_id_or_child_missing', freeRefreshed: false };
   const workspaceId = String(mother.accountId).trim();
   const stored = workspaceTokenFor(child, workspaceId) || workspaceTokenFor(child, mother.team);
@@ -4833,39 +4834,7 @@ async function renewUnauthorizedTeamToken(mother, child, { allowCredentialLogin 
     }
   }
 
-  if (!allowCredentialLogin) {
-    return { ok: false, status: 401, code: 'team_token_refresh_failed', message: 'Team AT 已失效，未找到可用 RT；额度检测不会启动登录流程', freeRefreshed: false, credentialLogin: false, credentialLoginAttempted: false };
-  }
-  const backoff = activeTeamAuthBackoff(child, mother.team);
-  if (backoff) {
-    return { ok: false, status: 429, code: 'team_auth_retry_backoff', message: `Team OAuth 自动重登正在退避：${backoff.message}`, retryAfter: backoff.retryAfter, freeRefreshed: false, credentialLogin: false, credentialLoginAttempted: false };
-  }
-  const teamOAuth = await acquireTeamAuth(mother, child, { force: true });
-  if (!teamOAuth.ok) {
-    return {
-      ok: false,
-      status: teamOAuth.status || 502,
-      code: teamOAuth.code || 'team_oauth_refresh_failed',
-      message: teamOAuth.message || 'team_oauth_refresh_failed',
-      freeRefreshed: false,
-      credentialLogin: false,
-      credentialLoginAttempted: true,
-      needsInput: Boolean(teamOAuth.needsInput),
-      browserRequired: Boolean(teamOAuth.browserRequired),
-      authUrl: teamOAuth.authUrl || null,
-    };
-  }
-
-  const workspaceToken = workspaceTokenFor(child, workspaceId) || workspaceTokenFor(child, mother.team);
-  if (!workspaceToken?.accessToken) return { ok: false, status: 502, message: 'renewed_workspace_token_missing', freeRefreshed: false, credentialLogin: true, credentialLoginAttempted: true };
-  if (childIsWorkspaceOwner(child, mother) || childMatchesKnownTeamOwner(child, mother)) {
-    upsertTeamOwnerFromChild(mother, child, workspaceId, workspaceToken);
-  }
-  const fallbackMessage = teamOAuth.oauthFallback ? `，Sub2API OAuth 不可用时已自动回退本地 OAuth（${teamOAuth.oauthFallback.code}）` : '';
-  const syncMessage = teamOAuth.sub2api && !teamOAuth.sub2api.synced ? `，Sub2API 同步未完成：${teamOAuth.sub2api.message || 'unknown_error'}` : '';
-  addHistory('刷新 Team JSON', `${child.email} 已重新完成 OAuth 登录并选择 ${mother.team}${fallbackMessage}${syncMessage}`, teamOAuth.partial ? 'partial' : 'success');
-  await persist();
-  return { ok: true, status: 200, message: 'team_token_renewed', source: 'team_oauth_email_password_2fa', freeRefreshed: false, credentialLogin: true, credentialLoginAttempted: true, partial: Boolean(teamOAuth.partial), oauthFallback: teamOAuth.oauthFallback || null, sub2api: teamOAuth.sub2api || null };
+  return { ok: false, status: 401, code: 'team_token_refresh_failed', message: 'Team 授权无法刷新，请到 Free 账号管理重新获取 Team JSON；额度检测不会启动登录流程', freeRefreshed: false, credentialLogin: false, credentialLoginAttempted: false };
 }
 
 async function pushRenewedTeamJson(mother, { emails = [], mode = 'create_only' } = {}) {
@@ -4888,18 +4857,11 @@ async function pushRenewedTeamJson(mother, { emails = [], mode = 'create_only' }
   };
 }
 
-async function checkTeam(motherId, { childIds = [], allowCredentialLogin = true } = {}) {
+async function checkTeam(motherId, { childIds = [] } = {}) {
   const mother = findMother(motherId);
   if (!mother) return { ok: false, status: 404, message: 'mother_not_found' };
-  let managerRecovery = await recoverTeamManagerToken(mother, { allowCredentialLogin: false });
+  const managerRecovery = await recoverTeamManagerToken(mother, { allowCredentialLogin: false });
   let workspace = await syncMotherWorkspace(mother, { allowCredentialLogin: false }).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
-  if (allowCredentialLogin && !workspace.ok && isOpenAiAuthFailure(workspace)) {
-    // Only a confirmed unauthorized response may enter the credential-login
-    // fallback. The sync routine refreshes the primary mother token separately
-    // because subscription/seat data cannot be queried through a child owner.
-    workspace = await syncMotherWorkspace(mother, { allowCredentialLogin: true }).catch((error) => ({ ok: false, message: error?.message || 'workspace_sync_failed', members: [] }));
-    managerRecovery = { ok: workspace.ok, status: workspace.status, source: workspace.ok ? 'workspace_401_recovery' : null };
-  }
   const selectedChildren = new Set(Array.isArray(childIds) ? childIds.map(String) : []);
   const members = state.children.filter((child) => (!selectedChildren.size || selectedChildren.has(String(child.id)))
     && isChildMemberOfTeam(child, mother.team)
@@ -4931,7 +4893,7 @@ async function checkTeam(motherId, { childIds = [], allowCredentialLogin = true 
       }
       const livenessBanMessage = liveness?.banned ? explicitAccountBanMessage(liveness) || 'OpenAI 账号已被停用或封禁' : '';
       if (!initialBanMessage && !livenessBanMessage && isOpenAiAuthFailure(result)) {
-        tokenRecovery = await renewUnauthorizedTeamToken(mother, child, { allowCredentialLogin });
+        tokenRecovery = await renewUnauthorizedTeamToken(mother, child);
         if (tokenRecovery.ok) {
           const renewedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
           result = await probeUsage(renewedToken?.accessToken || '', mother.accountId);
@@ -4947,7 +4909,7 @@ async function checkTeam(motherId, { childIds = [], allowCredentialLogin = true 
         message: banMessage,
       });
       const membership = membershipFor(child, mother.team);
-      return { id: child.id, email: child.email, ...result, banned: Boolean(banMessage), banReason: banMessage || null, liveness: liveness ? { ok: liveness.ok, status: liveness.status, message: liveness.message, banned: Boolean(liveness.banned), latencyMs: liveness.latencyMs } : null, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, code: tokenRecovery.code || null, message: tokenRecovery.message, retryAfter: tokenRecovery.retryAfter || null, freeRefreshed: tokenRecovery.freeRefreshed, credentialLogin: Boolean(tokenRecovery.credentialLogin), credentialLoginAttempted: Boolean(tokenRecovery.credentialLoginAttempted), needsInput: Boolean(tokenRecovery.needsInput), browserRequired: Boolean(tokenRecovery.browserRequired), partial: Boolean(tokenRecovery.partial), oauthFallback: tokenRecovery.oauthFallback || null, sub2api: tokenRecovery.sub2api || null } : null };
+      return { id: child.id, email: child.email, ...result, authorizationRequired: !banMessage && isOpenAiAuthFailure(result), banned: Boolean(banMessage), banReason: banMessage || null, liveness: liveness ? { ok: liveness.ok, status: liveness.status, message: liveness.message, banned: Boolean(liveness.banned), latencyMs: liveness.latencyMs } : null, quotaSource: quotaToken ? 'team' : 'team_token_missing', quota5h: membership?.quota5h ?? null, quota7d: membership?.quota7d ?? null, tokenRecovery: tokenRecovery ? { attempted: true, ok: tokenRecovery.ok, status: tokenRecovery.status, code: tokenRecovery.code || null, message: tokenRecovery.message, retryAfter: tokenRecovery.retryAfter || null, freeRefreshed: tokenRecovery.freeRefreshed, credentialLogin: Boolean(tokenRecovery.credentialLogin), credentialLoginAttempted: Boolean(tokenRecovery.credentialLoginAttempted), needsInput: Boolean(tokenRecovery.needsInput), browserRequired: Boolean(tokenRecovery.browserRequired), partial: Boolean(tokenRecovery.partial), oauthFallback: tokenRecovery.oauthFallback || null, sub2api: tokenRecovery.sub2api || null } : null };
     } catch (error) {
       applyQuotaResult(child, { ok: false, status: 502, message: error?.message || 'quota_probe_failed' }, mother.team, kickWindow, { createMembership: state.settings.delayedKickEnabled && kickWindow !== 'time' });
       return { id: child.id, email: child.email, ok: false, status: 502, message: error?.message || 'quota_probe_failed', quota5h: null, quota7d: null, tokenRecovery: null };
@@ -4997,6 +4959,7 @@ async function checkTeam(motherId, { childIds = [], allowCredentialLogin = true 
     bannedAccounts: bannedAccounts.map((result) => ({ id: result.id, email: result.email, reason: result.banReason })),
     sub2apiPush,
     managerRecovery,
+    managerAuthorizationRequired: !ownerBanReason && [ownerProbe, workspace.subscriptionResult, workspace.membersResult].some((probe) => isOpenAiAuthFailure(probe)),
   };
 }
 
@@ -5533,7 +5496,7 @@ async function refillTeamInternal(motherId, mother, { manualTimersOnly = false, 
   let quotaCheck = null;
   if (quotaAccounts.length) {
     updateRotationProgress(mother, 'quota', { message: `正在检测 ${quotaAccounts.length} 个成员的真实额度` });
-    quotaCheck = await checkTeam(mother.id, { childIds: quotaAccounts.map((child) => child.id), allowCredentialLogin: false });
+    quotaCheck = await checkTeam(mother.id, { childIds: quotaAccounts.map((child) => child.id) });
   }
   updateRotationProgress(mother, 'push', { message: pushAccounts.length ? `正在推送 ${pushAccounts.length} 个新 Team JSON` : '没有新的 Team JSON 需要推送' });
   const joinedSub2apiPush = pushAccounts.length > 0
