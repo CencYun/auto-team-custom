@@ -7,6 +7,13 @@ import './mailbox-vault.css';
 const endpoint = '/api/mailbox-vault';
 const emptyRecord = () => ({ account: '', password: '', totp: '' });
 
+function formatImportTime(value) {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return '—';
+  const pad = (part) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function MailboxDialog({ title, busy, onClose, children }) {
   const dialogRef = useRef(null);
   const closeRef = useRef(onClose);
@@ -279,8 +286,8 @@ export default function MailboxVaultView({ apiRequest, notify }) {
     {loadError ? <div className="empty-state mother-vault-error" role="alert"><AlertTriangle size={25} /><strong>{loadError}</strong><button type="button" className="button ghost" onClick={() => setReload((current) => current + 1)}>重试</button></div>
       : loading ? <div className="empty-state" role="status"><RefreshCw size={25} className="button-spinner" /><strong>正在加载邮箱</strong></div>
         : !visibleRecords.length ? <div className="empty-state"><Mail size={28} /><strong>{records.length ? '没有匹配的邮箱' : '暂未存放邮箱'}</strong><span>{records.length ? '请调整搜索条件。' : '点击“一键导入邮箱”，批量粘贴或选择文件，自动拆分为独立邮箱。'}</span></div>
-          : <div className="table-wrap mother-vault-table-wrap"><table className="data-table mother-vault-table mailbox-vault-table"><thead><tr><th className="mother-vault-check"><span className="mother-vault-sr-only">选择</span></th><th>邮箱账号</th><th>密码</th><th>2FA 密钥</th><th>操作</th></tr></thead><tbody>{visibleRecords.map((record) => <tr key={record.id} className={selectedSet.has(record.id) ? 'mother-vault-selected' : ''}>
-            <td className="mother-vault-check"><input type="checkbox" aria-label={`选择邮箱 ${record.account}`} checked={selectedSet.has(record.id)} disabled={unavailable} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, record.id])] : current.filter((id) => id !== record.id))} /></td><td><strong className="mother-vault-account">{record.account}</strong>{record.exportedAt && <small className="mailbox-vault-used" title="已导出，可再次导出">已使用</small>}</td><td>{renderSecret(record, 'password', '密码')}</td><td>{renderSecret(record, 'totp', '2FA 密钥')}</td><td><div className="mother-vault-row-actions"><button type="button" className="mother-vault-icon" aria-label={`编辑邮箱 ${record.account}`} title="编辑邮箱" disabled={unavailable} onClick={() => editRecord(record)}><Pencil size={15} /></button><button type="button" className="mother-vault-icon mother-vault-danger" aria-label={`删除邮箱 ${record.account}`} title="删除本地邮箱" disabled={unavailable} onClick={() => openDialog('delete', { ids: [record.id] })}><Trash2 size={15} /></button></div></td>
+          : <div className="table-wrap mother-vault-table-wrap"><table className="data-table mother-vault-table mailbox-vault-table"><thead><tr><th className="mother-vault-check"><span className="mother-vault-sr-only">选择</span></th><th>邮箱账号</th><th>密码</th><th>2FA 密钥</th><th>导入时间</th><th>操作</th></tr></thead><tbody>{visibleRecords.map((record) => <tr key={record.id} className={selectedSet.has(record.id) ? 'mother-vault-selected' : ''}>
+            <td className="mother-vault-check"><input type="checkbox" aria-label={`选择邮箱 ${record.account}`} checked={selectedSet.has(record.id)} disabled={unavailable} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, record.id])] : current.filter((id) => id !== record.id))} /></td><td><strong className="mother-vault-account">{record.account}</strong>{record.exportedAt && <small className="mailbox-vault-used" title="已导出，可再次导出">已使用</small>}</td><td>{renderSecret(record, 'password', '密码')}</td><td>{renderSecret(record, 'totp', '2FA 密钥')}</td><td><time className="mailbox-vault-import-time" dateTime={formatImportTime(record.createdAt) === '—' ? undefined : record.createdAt} title="首次导入或添加时间（本机时区）">{formatImportTime(record.createdAt)}</time></td><td><div className="mother-vault-row-actions"><button type="button" className="mother-vault-icon" aria-label={`编辑邮箱 ${record.account}`} title="编辑邮箱" disabled={unavailable} onClick={() => editRecord(record)}><Pencil size={15} /></button><button type="button" className="mother-vault-icon mother-vault-danger" aria-label={`删除邮箱 ${record.account}`} title="删除本地邮箱" disabled={unavailable} onClick={() => openDialog('delete', { ids: [record.id] })}><Trash2 size={15} /></button></div></td>
           </tr>)}</tbody></table></div>}
     <p className="mother-vault-footnote">TXT 每行：邮箱----密码----2FA。导出的邮箱会标注“已使用”，仍可再次导出或重新导入。</p>
     {dialog && <MailboxDialog title={dialog.type === 'import' ? '批量导入邮箱' : dialog.type === 'delete' ? '删除本地邮箱' : dialog.type === 'edit' ? '编辑邮箱' : '添加邮箱'} busy={busy} onClose={closeDialog}>

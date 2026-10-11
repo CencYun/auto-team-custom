@@ -9,7 +9,7 @@ import {
   Sparkles, Sun, Trash2, UserMinus, UserRound, Users, Wrench, X, Zap
 } from 'lucide-react';
 import { groupTeamAccounts, teamRecordsShareIdentity } from '../shared/team-members.mjs';
-import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamMemberRemovalState, teamAutoJsonCandidates, teamAutoJsonRowTarget } from '../shared/team-workflow-ui.mjs';
+import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamMemberRemovalState, teamAutoJsonCandidates, teamAutoJsonRowTarget, officialTeamAuthorizationUrl, manualTeamAuthorizationUrl } from '../shared/team-workflow-ui.mjs';
 import { teamQuotaState } from '../shared/team-quota-ui.mjs';
 import { teamQuotaBatchTargets } from '../shared/team-quota-batch.mjs';
 import { teamMemberRemovalCandidates, runTeamMemberRemovalBatch } from '../shared/team-member-removal-batch.mjs';
@@ -688,6 +688,8 @@ function App({ onLogout }) {
   const roxyConcurrencySaveRef = useRef(false);
   const [quotaRefreshStates, setQuotaRefreshStates] = useState({});
   const quotaRefreshPending = useRef(new Map());
+  const teamAuthPending = useRef(new Set());
+  const [teamAuthBusy, setTeamAuthBusy] = useState(false);
   const [batchQuota, setBatchQuota] = useState({ loading: false, total: 0, completed: 0, succeeded: 0, failed: 0, results: [], scopeLabel: '', error: '' });
   const batchQuotaPending = useRef(false);
   const memberRemovalPending = useRef(new Set());
@@ -1252,7 +1254,7 @@ function App({ onLogout }) {
   }
 
   async function acquireAccount(id, mode = 'refresh-at', credentials = {}) {
-    if (!id || acquireStates[id]?.loading) return;
+    if (!id || acquireStates[id]?.loading || teamAuthPending.current.size) return;
     setAcquireStates((current) => ({ ...current, [id]: { loading: true, status: 'queued' } }));
     try {
       const result = await apiRequest(`/api/children/${encodeURIComponent(id)}/acquire`, { method: 'POST', body: JSON.stringify({ ...credentials, mode, action: mode, format: mode === 'free-json' ? 'free-json' : 'access-token', refresh: mode === 'refresh-at' }) });
@@ -1273,11 +1275,34 @@ function App({ onLogout }) {
     }
   }
 
+  function beginTeamAuthOperation(id, workspaceId) {
+    if (teamAuthPending.current.size || autoJsonStartPending.current || autoJson.starting || ['queued', 'running'].includes(autoJson.job?.status) || batchAcquire.loading || acquireStates[id]?.loading) throw new Error('授权任务正在执行，请等待完成后重试');
+    const operationKey = JSON.stringify([id, workspaceId]);
+    teamAuthPending.current.add(operationKey);
+    setTeamAuthBusy(true);
+    return () => {
+      teamAuthPending.current.delete(operationKey);
+      setTeamAuthBusy(teamAuthPending.current.size > 0);
+    };
+  }
+
+  async function generateTeamAuthLink(id, motherId, workspaceId) {
+    if (!id || !motherId || !workspaceId) throw new Error('请重新选择账号和目标 Team');
+    const finish = beginTeamAuthOperation(id, workspaceId);
+    try {
+      const result = await apiRequest(`/api/children/${encodeURIComponent(id)}/team-auth`, { method: 'POST', body: JSON.stringify({ motherId, workspaceId, manual: true }) });
+      await refreshState(false).catch(() => {});
+      if (result.ok === false) throw new Error(result.message || '授权链接生成失败');
+      return result;
+    } finally { finish(); }
+  }
+
   async function submitAccountCallback(id, callbackUrl, workspaceId = null, motherId = null) {
     if (!id) throw new Error('无法定位账号记录');
     if (!workspaceId && acquireStates[id]?.loading) throw new Error('账号正在获取授权，请稍后提交');
     const path = workspaceId ? 'team-auth' : 'acquire';
     const fields = workspaceId ? { callbackUrl, workspaceId, motherId, force: true } : { callbackUrl, mode: 'free-json', action: 'free-json', format: 'free-json' };
+    const finish = workspaceId ? beginTeamAuthOperation(id, workspaceId) : null;
     if (!workspaceId) setAcquireStates((current) => ({ ...current, [id]: { ...current[id], loading: true, status: current[id]?.status || 'authenticating' } }));
     try {
       const payload = await apiRequest(`/api/children/${encodeURIComponent(id)}/${path}`, { method: 'POST', body: JSON.stringify(fields) });
@@ -1287,10 +1312,11 @@ function App({ onLogout }) {
       if (!workspaceId) {
         setAcquireStates((current) => ({ ...current, [id]: { loading: false, status, message: payload.message || payload.child?.login?.message || '', authUrl: '' } }));
         await downloadFreeJson(id);
-      }
+      } else await refreshTeamQuota(id, motherId, workspaceId, { silent: true });
       notify(workspaceId ? 'Team JSON 已获取并保存' : 'JSON 已获取并保存');
       return payload;
     } finally {
+      finish?.();
       if (!workspaceId) setAcquireStates((current) => ({ ...current, [id]: { ...current[id], loading: false } }));
     }
   }
@@ -1331,7 +1357,7 @@ function App({ onLogout }) {
   }
 
   async function startAutoJson(ids = [], motherId = jsonMotherId, { retryFailed = false, retryJobId = '', retryAccount = false } = {}) {
-    if (autoJsonStartPending.current || roxyConcurrencySaveRef.current || autoJson.starting || ['queued', 'running'].includes(autoJson.job?.status) || batchAcquire.loading) return null;
+    if (teamAuthPending.current.size || autoJsonStartPending.current || roxyConcurrencySaveRef.current || autoJson.starting || ['queued', 'running'].includes(autoJson.job?.status) || batchAcquire.loading) return null;
     const mother = mothers.find((item) => item.id === motherId);
     if (!mother) { notify('请先选择要获取授权的 Team', 'info'); return null; }
     const requestedIds = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && id))];
@@ -1966,7 +1992,7 @@ function App({ onLogout }) {
       {view === 'vault' && <MotherVaultView apiRequest={apiRequest} notify={notify} />}
       {view === 'mailbox' && <MailboxVaultView apiRequest={apiRequest} notify={notify} />}
       {view === 'guide' && <UserGuideView onNavigate={(target) => { if (target === 'exports') openAccountExports(); else setView(target); window.scrollTo(0, 0); }} />}
-      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} loading={isProcessing} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteLocalAccounts={batchDeleteLocalAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} submitAccountCallback={submitAccountCallback} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} autoJson={autoJson} startAutoJson={startAutoJson} jsonMotherId={jsonMotherId} setJsonMotherId={setJsonMotherId} roxyEnabled={integrations.roxy?.enabled === true} roxyConcurrency={integrations.roxy?.concurrency || 1} roxyConcurrencySaving={roxyConcurrencySaving} saveRoxyConcurrency={saveRoxyConcurrency} refreshTeamQuota={refreshTeamQuota} quotaRefreshStates={quotaRefreshStates} batchQuota={batchQuota} refreshAllTeamQuotas={refreshAllTeamQuotas} batchRemoval={batchRemoval} openBatchRemoval={(motherId) => setBatchRemovalDialog({ motherId })} />}
+      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} loading={isProcessing} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteLocalAccounts={batchDeleteLocalAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} submitAccountCallback={submitAccountCallback} generateTeamAuthLink={generateTeamAuthLink} teamAuthBusy={teamAuthBusy} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} autoJson={autoJson} startAutoJson={startAutoJson} jsonMotherId={jsonMotherId} setJsonMotherId={setJsonMotherId} roxyEnabled={integrations.roxy?.enabled === true} roxyConcurrency={integrations.roxy?.concurrency || 1} roxyConcurrencySaving={roxyConcurrencySaving} saveRoxyConcurrency={saveRoxyConcurrency} refreshTeamQuota={refreshTeamQuota} quotaRefreshStates={quotaRefreshStates} batchQuota={batchQuota} refreshAllTeamQuotas={refreshAllTeamQuotas} batchRemoval={batchRemoval} openBatchRemoval={(motherId) => setBatchRemovalDialog({ motherId })} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} onSelect={setSelectedHistory} />}
       {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} joinMode={joinMode} setJoinMode={setJoinMode} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} delayedKickEnabled={delayedKickEnabled} setDelayedKickEnabled={setDelayedKickEnabled} delayedKickMinutes={delayedKickMinutes} setDelayedKickMinutes={setDelayedKickMinutes} saveSettings={saveSettings} versionInfo={versionInfo} />}
       {view === 'integrations' && <IntegrationsView integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} />}
@@ -2497,7 +2523,7 @@ function TeamJsonQuota({ workflow, account, onRefresh, refreshState, disabled, m
   </div>;
 }
 
-function FreeAccountsView({ children, allChildren, mothers, loading = false, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, exportTeamSub2Api, pushTeamSub2Api, removeChild, deleteFreeAccount, batchDeleteLocalAccounts, openJsonImport, editAccount, acquireAccount, submitAccountCallback, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency, autoJson, startAutoJson, jsonMotherId, setJsonMotherId, roxyEnabled = false, roxyConcurrency = 1, roxyConcurrencySaving = false, saveRoxyConcurrency, refreshTeamQuota, quotaRefreshStates = {}, batchQuota, refreshAllTeamQuotas, batchRemoval, openBatchRemoval }) {
+function FreeAccountsView({ children, allChildren, mothers, loading = false, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, exportTeamSub2Api, pushTeamSub2Api, removeChild, deleteFreeAccount, batchDeleteLocalAccounts, openJsonImport, editAccount, acquireAccount, submitAccountCallback, generateTeamAuthLink, teamAuthBusy = false, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency, autoJson, startAutoJson, jsonMotherId, setJsonMotherId, roxyEnabled = false, roxyConcurrency = 1, roxyConcurrencySaving = false, saveRoxyConcurrency, refreshTeamQuota, quotaRefreshStates = {}, batchQuota, refreshAllTeamQuotas, batchRemoval, openBatchRemoval }) {
   const [filter, setFilter] = useState('all');
   const [selectedAccountIds, setSelectedAccountIds] = useState([]);
   const [batchDeleting, setBatchDeleting] = useState(false);
@@ -2506,6 +2532,8 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
   const [actionAccountId, setActionAccountId] = useState(null);
   const [actionMotherId, setActionMotherId] = useState('');
   const [manualAuth, setManualAuth] = useState(null);
+  const manualAuthSequence = useRef(0);
+  const manualAuthPending = useRef(false);
   const [removal, setRemoval] = useState(null);
   const [removing, setRemoving] = useState(false);
   const [removalError, setRemovalError] = useState('');
@@ -2549,7 +2577,7 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
   const completedAutoCount = targetMother ? allChildren.filter((account) => !isBanned(account) && workflowFor(account).ready).length : 0;
   const retryVerificationCount = allChildren.filter((account) => !account.sub2apiStatus?.exportable && account.login?.browserRequired && !['waiting_code', 'phone_verification_required', 'credentials_required'].includes(account.login.status)).length;
   const automaticBusy = autoJson?.starting || ['queued', 'running'].includes(autoJson?.job?.status);
-  const acquiring = automaticBusy || batchAcquire?.loading || roxyConcurrencySaving || removing || batchDeleting || singleDeleting || loading;
+  const acquiring = automaticBusy || batchAcquire?.loading || teamAuthBusy || roxyConcurrencySaving || removing || batchDeleting || singleDeleting || loading;
   const selectableAccount = (account) => account.localDeletion?.eligible === true && !acquireStates?.[account.id]?.loading;
   const deletionHint = (account) => acquireStates?.[account.id]?.loading ? '此账号正在获取授权，请等待完成' : account.localDeletion?.message || '尚未取得删除状态，请刷新列表';
   const selectedSet = new Set(selectedAccountIds);
@@ -2563,6 +2591,14 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
   const actionWorkflows = actionAccount ? teamAccountWorkflows(actionAccount, mothers).filter((workflow) => workflow.related) : [];
   const actionMother = actionWorkflows.find((workflow) => workflow.mother.id === actionMotherId)?.mother || null;
   const manualAccount = allChildren.find((account) => account.id === manualAuth?.id);
+  const manualMother = mothers.find((mother) => mother.id === manualAuth?.motherId);
+  const manualWorkflow = teamAutoJsonState(manualAccount, manualMother);
+  const manualStale = Boolean(manualAuth && (!manualAccount || manualAccount.email !== manualAuth.email
+    || manualAuth.motherId && (!manualMother || manualWorkflow.workspaceId !== manualAuth.workspaceId)));
+  // Persisted login stages can survive a restart; only live operations block recovery.
+  const manualLoginBusy = Boolean(automaticBusy || teamAuthBusy || acquireStates?.[manualAuth?.id]?.loading);
+  const manualLink = !manualStale && !manualAuth?.completed && officialTeamAuthorizationUrl(manualAuth?.authUrl
+    || (manualAuth?.scope === 'team' ? manualWorkflow.login?.browserRequired && manualWorkflow.login.authUrl : manualAccount?.login?.browserRequired && manualAccount.login.authUrl));
   const removalAccount = allChildren.find((account) => account.id === removal?.id);
   const removalWorkflows = removalAccount ? teamAccountWorkflows(removalAccount, mothers).filter((item) => item.member)
     .map((item) => ({ ...item, ...teamMemberRemovalState(removalAccount, item.mother) })) : [];
@@ -2660,12 +2696,60 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
   }
 
   function openManual(account, result = null, explicitMother = targetMother) {
+    if (manualAuthPending.current) return;
     const manualMother = result?.motherId ? mothers.find((mother) => mother.id === result.motherId) : explicitMother;
     const workflow = teamAutoJsonState(account, manualMother);
     const stored = acquireStates?.[account.id];
-    const current = result || (stored?.workspaceId === workflow.workspaceId && stored?.motherId === manualMother?.id ? stored : null);
-    const scope = current?.authScope || (workflow.related && (workflow.member || workflow.login) ? 'team' : 'free');
-    setManualAuth({ id: account.id, scope, motherId: manualMother?.id, workspaceId: current?.workspaceId || workflow.workspaceId, authUrl: current?.authUrl || '', browserRequired: current?.browserRequired, message: current?.message || '' });
+    const candidate = result || stored;
+    const current = candidate?.workspaceId === workflow.workspaceId && candidate?.motherId === manualMother?.id ? candidate : null;
+    const scope = current?.authScope === 'free' ? 'free' : manualMother ? 'team' : 'free';
+    const login = scope === 'team' ? workflow.login : account.login;
+    setManualAuth({ sessionId: ++manualAuthSequence.current, id: account.id, email: account.email, scope, motherId: manualMother?.id, workspaceId: workflow.workspaceId, authUrl: officialTeamAuthorizationUrl(login?.browserRequired && login.authUrl) || '', message: login?.message || current?.message || '', error: '', generating: false, completed: false });
+  }
+
+  function closeManual() {
+    manualAuthSequence.current += 1;
+    setManualAuth(null);
+  }
+
+  function updateManual(target, fields) {
+    if (manualAuthSequence.current !== target.sessionId) return;
+    setManualAuth((current) => current?.sessionId === target.sessionId ? { ...current, ...fields } : current);
+  }
+
+  async function generateManualLink() {
+    if (!manualAuth || manualAuth.scope !== 'team' || manualStale || acquiring || manualLoginBusy || manualAuthPending.current) return;
+    const target = { ...manualAuth };
+    manualAuthPending.current = true;
+    updateManual(target, { generating: true, error: '', copied: false });
+    try {
+      const result = await generateTeamAuthLink(target.id, target.motherId, target.workspaceId);
+      const authUrl = manualTeamAuthorizationUrl(result, target);
+      if (!authUrl) throw new Error('未返回匹配此账号和 Team 的官方授权链接，请重试');
+      updateManual(target, { authUrl, message: result.message || '授权链接已生成，请使用上方账号登录目标 Team' });
+    } catch (error) { updateManual(target, { error: error.message || '授权链接生成失败，请重试' }); }
+    finally { manualAuthPending.current = false; updateManual(target, { generating: false }); }
+  }
+
+  async function copyManualLink() {
+    if (!manualLink || !manualAuth) return;
+    const target = { ...manualAuth };
+    try {
+      await navigator.clipboard.writeText(manualLink);
+      updateManual(target, { copied: true, error: '' });
+    } catch { updateManual(target, { error: '复制失败，请手动选中上方链接复制' }); }
+  }
+
+  async function submitManualCallback(callbackUrl) {
+    if (!manualAuth || manualStale || acquiring || manualLoginBusy || manualAuthPending.current) throw new Error('账号或授权状态已变化，请稍后重试');
+    const target = { ...manualAuth };
+    manualAuthPending.current = true;
+    try {
+      const result = await submitAccountCallback(target.id, callbackUrl, target.scope === 'team' ? target.workspaceId : null, target.motherId);
+      updateManual(target, { completed: true, authUrl: '', error: '', message: target.scope === 'team' ? 'Team JSON 已保存，额度状态已刷新' : '个人 JSON 已保存' });
+      if (target.scope === 'free' && target.motherId && manualAuthSequence.current === target.sessionId) await startAutoJson([target.id], target.motherId);
+      return result;
+    } finally { manualAuthPending.current = false; }
   }
 
   function logQuotaDetailFor(item, referenceJob = job) {
@@ -2818,7 +2902,7 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
             <td className="account-status-cell"><div className="account-status-stack"><StatusBadge status={banned ? 'banned' : account.status} /><CredentialState account={account} />{acquireState ? <AcquireStatus state={acquireState} account={{ ...account, login: acquireState.authScope === 'free' ? account.login : workflow.login }} /> : !workflow.related && <AcquireStatus account={account} />}<small className={`account-personal-json ${account.sub2apiStatus?.exportable ? 'ready' : ''}`}>{account.sub2apiStatus?.exportable ? '个人 JSON 已保存' : '个人授权未获取'}</small></div></td>
             <td className="account-team-json-cell"><div className="account-team-authorizations">
               {teamWorkflows.map((teamWorkflow) => <div className="account-team-authorization" key={teamWorkflow.mother.id}>
-                <div className="account-team-authorization-head"><div className="account-team-identity"><strong>{teamDisplayName(teamWorkflow.mother)}</strong><small className="team-authorization-owner" title={teamWorkflow.mother.email}>{teamWorkflow.mother.email}</small></div><span className={`sub2api-state ${teamWorkflow.ready ? 'ready' : ''}`}>{teamWorkflow.ready ? 'Team JSON 就绪' : teamWorkflow.invited && !teamWorkflow.member ? '待接受邀请' : teamWorkflow.related ? '待 Team 授权' : ['kicked', 'cooldown'].includes(teamWorkflow.membership?.status) ? '已移出 · 历史授权' : '未加入此 Team'}</span></div>
+                <div className="account-team-authorization-head"><div className="account-team-identity"><strong>{teamDisplayName(teamWorkflow.mother)}</strong><small className="team-authorization-owner" title={teamWorkflow.mother.email}>{teamWorkflow.mother.email}</small></div><span className={`sub2api-state ${teamWorkflow.ready ? 'ready' : ''}`}>{teamWorkflow.needsReauthorization ? '需重新授权' : teamWorkflow.retryAuthorization ? '刷新失败 · 可重新获取' : teamWorkflow.ready ? 'Team JSON 就绪' : teamWorkflow.invited && !teamWorkflow.member ? '待接受邀请' : teamWorkflow.related ? '待 Team 授权' : ['kicked', 'cooldown'].includes(teamWorkflow.membership?.status) ? '已移出 · 历史授权' : '未加入此 Team'}</span></div>
                 {teamWorkflow.related && !teamWorkflow.ready && teamWorkflow.login && <TeamAuthorization account={{ ...account, teamLogin: teamWorkflow.login }} workspaceId={teamWorkflow.workspaceId} />}
                 <TeamJsonQuota workflow={teamWorkflow} account={account} onRefresh={refreshTeamQuota} refreshState={quotaRefreshStates[JSON.stringify([account.id, teamWorkflow.mother.id, teamWorkflow.workspaceId])]} disabled={banned || acquiring || Boolean(storedState?.loading)} manualAction={teamWorkflow.related && <button className="text-button" disabled={banned || acquiring || Boolean(storedState?.loading)} onClick={() => openManual(account, null, teamWorkflow.mother)}>手动授权 / 回调<ChevronRight size={12} /></button>} />
               </div>)}
@@ -2867,17 +2951,24 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
       {(removalStale || removalError) && <p className="auto-json-log-error" role="alert">{removalStale ? '账号资料已变化，请关闭后重新选择。' : removalError}</p>}
       <div className="modal-foot"><button className="button ghost" disabled={removing} onClick={() => setRemoval(null)}>取消</button><button className="button danger" disabled={acquiring || removalStale || !removalTarget?.selectable || Boolean(acquireStates?.[removal.id]?.loading)} onClick={confirmRemoveMember}><UserMinus size={15} />{removing ? '正在移除' : '确认移除成员'}</button></div>
     </Modal>}
-    {manualAccount && <Modal title={manualAuth.scope === 'team' ? '手动 Team 授权' : '手动登录验证'} onClose={() => setManualAuth(null)} className="manual-oauth-modal">
-      <div className="account-action-identity">{manualAccount.email || manualAccount.id}</div>
-      {manualAuth.motherId && <p className="manual-oauth-hint">目标 Team：{teamDisplayName(mothers.find((mother) => mother.id === manualAuth.motherId))} · {mothers.find((mother) => mother.id === manualAuth.motherId)?.email}</p>}
+    {manualAuth && <Modal title={manualAuth.scope === 'team' ? '手动 Team 授权' : '手动登录验证'} onClose={closeManual} className="manual-oauth-modal">
+      <div className="account-action-identity">{manualAuth.email || manualAuth.id}</div>
+      {manualAuth.motherId && <p className="manual-oauth-hint">目标 Team：{teamDisplayName(manualMother)} · {manualMother?.email}<br />工作空间：<span className="mono">{manualAuth.workspaceId}</span></p>}
       <p className="manual-oauth-hint">{manualAuth.scope === 'team' ? '完成目标团队的官方授权后，粘贴含 code 和 state 的完整回调地址。' : manualAuth.motherId ? '先完成子号的官方登录验证，提交回调后会继续获取目标 Team JSON。' : '完成个人登录验证后，粘贴含 code 和 state 的完整回调地址。'}</p>
-      <AcquireStatus state={manualAuth.authUrl ? { status: 'browser_required', authUrl: manualAuth.authUrl, message: manualAuth.message } : undefined} account={{ ...manualAccount, login: manualAuth.scope === 'free' ? manualAccount.login : teamAutoJsonState(manualAccount, mothers.find((mother) => mother.id === manualAuth.motherId)).login }} />
-      <div className="account-callback-panel"><OAuthCallbackInput onSubmit={async (callbackUrl) => {
-        const result = await submitAccountCallback(manualAccount.id, callbackUrl, manualAuth.scope === 'team' ? manualAuth.workspaceId : null, manualAuth.motherId);
-        if (manualAuth.motherId) await startAutoJson([manualAccount.id], manualAuth.motherId);
-        return result;
-      }} disabled={acquiring || Boolean(acquireStates?.[manualAccount.id]?.loading)} /></div>
-      <p className="manual-oauth-hint">手动回调是额外验证时的备用选项；正常获取请使用“全自动获取 JSON”。</p>
+      {manualStale ? <p className="auto-json-log-error" role="alert">账号或目标工作空间已变化，请关闭后重新选择。</p> : manualAuth.completed ? <p className="manual-oauth-success" role="status">{manualAuth.message}</p> : <>
+        {manualLink ? <div className="manual-oauth-link-panel">
+          <label>官方授权链接<input aria-label="官方 Team 授权链接" readOnly value={manualLink} onFocus={(event) => event.target.select()} /></label>
+          <div className="manual-oauth-link-actions"><a className="button secondary compact-button" href={manualLink} target="_blank" rel="noreferrer"><ExternalLink size={14} />打开授权链接</a><button className="button ghost compact-button" onClick={copyManualLink}><Copy size={14} />{manualAuth.copied ? '已复制' : '复制链接'}</button></div>
+        </div> : manualAuth.scope === 'team' ? <div className="manual-oauth-link-panel">
+          <p className="manual-oauth-hint">先生成此账号在目标 Team 的授权链接，再在浏览器中完成授权。</p>
+          <button className="button secondary" disabled={acquiring || manualLoginBusy || manualAuth.generating || Boolean(acquireStates?.[manualAuth.id]?.loading) || isBanned(manualAccount)} onClick={generateManualLink}><RefreshCw size={14} className={manualAuth.generating ? 'button-spinner' : ''} />{manualAuth.generating ? '正在生成授权链接' : '生成授权链接'}</button>
+          {manualLoginBusy && <small role="status">授权任务正在执行，请等待当前任务结束。</small>}
+        </div> : <AcquireStatus account={manualAccount} />}
+        {manualAuth.error && <p className="auto-json-log-error" role="alert">{manualAuth.error}</p>}
+        <div className="account-callback-panel"><OAuthCallbackInput key={manualAuth.sessionId} onSubmit={submitManualCallback} disabled={acquiring || manualLoginBusy || manualAuth.generating || Boolean(acquireStates?.[manualAuth.id]?.loading) || isBanned(manualAccount)} /></div>
+      </>}
+      {manualAuth.scope === 'team' && quotaRefreshStates[JSON.stringify([manualAuth.id, manualAuth.motherId, manualAuth.workspaceId])]?.error && <p className="auto-json-log-error" role="status">{quotaRefreshStates[JSON.stringify([manualAuth.id, manualAuth.motherId, manualAuth.workspaceId])].error}</p>}
+      <p className="manual-oauth-hint">{manualAuth.scope === 'team' ? '生成链接后，请使用上方邮箱登录并选择目标 Team。回调成功后会保存 Team JSON 并检测额度。' : '手动回调用于完成浏览器中的登录验证。'}</p>
     </Modal>}
   </section>;
 }

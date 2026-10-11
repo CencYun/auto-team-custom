@@ -1,7 +1,11 @@
-.mailbox-vault-table { min-width: 600px; }
-.mailbox-vault-table th:nth-child(2) { width: 34%; }
-.mailbox-vault-table th:nth-child(3), .mailbox-vault-table th:nth-child(4) { width: 26%; }
+.mailbox-vault-table { min-width: 780px; }
+.mailbox-vault-table th:nth-child(2) { width: 28%; }
+.mailbox-vault-table th:nth-child(3) { width: 20%; }
+.mailbox-vault-table th:nth-child(4) { width: auto; }
+.mailbox-vault-table th:nth-child(5) { width: 134px; }
 .mailbox-vault-table th:last-child { width: 76px; }
 .mailbox-vault-table th, .mailbox-vault-table td { padding-top: 11px; padding-bottom: 11px; }
+.mailbox-vault-import-time { display: block; color: #748499; font-size: 11px; line-height: 1.5; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .mailbox-vault-table .mailbox-vault-used { display: block; margin-top: 3px; font-size: 10px; line-height: 1.4; color: #bf4545; }
+html[data-theme='dark'] .mailbox-vault-import-time { color: #a2b1bf; }
 html[data-theme='dark'] .mailbox-vault-table .mailbox-vault-used { color: #ee9999; }
