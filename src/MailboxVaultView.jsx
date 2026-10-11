@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Download, Eye, EyeOff, Mail, Pencil, Plus, RefreshCw, Search, Trash2, Upload, X } from 'lucide-react';
+import { AlertTriangle, Copy, Download, Eye, EyeOff, Mail, Pencil, Plus, RefreshCw, Search, Trash2, Upload, X } from 'lucide-react';
 import { exportMailboxVaultText } from '../shared/mailbox-vault-text.mjs';
 import './mother-vault.css';
 import './mailbox-vault.css';
@@ -186,6 +186,20 @@ export default function MailboxVaultView({ apiRequest, notify }) {
     } finally { if (mounted.current) setPending(''); }
   }
 
+  async function copyLoginCredentials() {
+    if (!selected.length || unavailable) return;
+    setPending('copy');
+    try {
+      const items = records.filter((record) => selectedSet.has(record.id));
+      validateRecords(items, selected);
+      const content = exportMailboxVaultText(items);
+      await navigator.clipboard.writeText(content);
+      if (mounted.current) notify(`已复制 ${items.length} 个邮箱的登录凭据`);
+    } catch {
+      if (mounted.current) notify('复制失败，请允许浏览器访问剪贴板后重试，或导出已选 TXT', 'error');
+    } finally { if (mounted.current) setPending(''); }
+  }
+
   async function exportRecords(all = false) {
     const ids = all ? records.map((record) => record.id) : [...selected];
     if (!ids.length || unavailable) return;
@@ -256,6 +270,7 @@ export default function MailboxVaultView({ apiRequest, notify }) {
       <button type="button" className="button primary" disabled={busy} onClick={() => openDialog('create')}><Plus size={15} />添加邮箱</button>
     </div></div>
     <div className="mother-vault-tools"><div className="search-box"><Search size={15} /><input aria-label="搜索邮箱" placeholder="搜索邮箱账号" value={search} onChange={(event) => setSearch(event.target.value)} /></div><div className="mother-vault-selection-actions">
+      <button type="button" className="button ghost" disabled={!selected.length || unavailable} onClick={copyLoginCredentials} title="复制已勾选邮箱的账号、密码和 2FA，每个邮箱一行"><Copy size={15} />{pending === 'copy' ? '正在复制' : '复制登录凭据'}</button>
       <button type="button" className="button ghost" disabled={!selected.length || unavailable} onClick={() => exportRecords()}><Download size={15} />{pending === 'export' ? '正在导出' : `导出已选 TXT (${selected.length})`}</button>
       <button type="button" className="button ghost" disabled={!records.length || unavailable} onClick={() => exportRecords(true)}><Download size={15} />{pending === 'export-all' ? '正在导出' : '全部导出 TXT'}</button>
       <button type="button" className="button ghost mother-vault-danger" disabled={!selected.length || unavailable} onClick={() => openDialog('delete', { ids: [...selected] })}><Trash2 size={15} />删除已选</button>

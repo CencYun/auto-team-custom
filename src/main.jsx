@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createPortal } from 'react-dom';
 import {
-  Activity, AlertTriangle, ArrowDownToLine, ArrowUpRight, Bot, Check, CheckCircle2,
+  Activity, AlertTriangle, ArrowDownToLine, ArrowUpRight, BookOpen, Bot, Check, CheckCircle2,
   ChevronLeft, ChevronRight, CircleHelp, Clock3, CloudDownload, Copy, Download, ExternalLink, Eye, EyeOff,
   FileText, Gauge, KeyRound, LayoutDashboard, ListFilter, LogIn, LogOut, Mail, Moon, MoreHorizontal,
   Pause, Play, Plug, Plus, RefreshCw, Settings2, ShieldAlert, ShieldCheck, SlidersHorizontal,
@@ -19,6 +19,7 @@ import RoxyIntegrationForm from './RoxyIntegrationForm.jsx';
 import AccountExportsView from './AccountExportsView.jsx';
 import MotherVaultView from './MotherVaultView.jsx';
 import MailboxVaultView from './MailboxVaultView.jsx';
+import UserGuideView from './UserGuideView.jsx';
 import './styles.css';
 
 const initialChildren = [];
@@ -45,6 +46,7 @@ const navItems = [
   { id: 'exports', label: '账号导出', icon: Download },
   { id: 'history', label: '操作历史', icon: Clock3 },
   { id: 'settings', label: '设置', icon: SlidersHorizontal },
+  { id: 'guide', label: '使用教程', icon: BookOpen },
 ];
 
 function emailDomain(email) {
@@ -664,7 +666,7 @@ function App({ onLogout }) {
   const [importMode, setImportMode] = useState('password-2fa');
   const [importFileName, setImportFileName] = useState('');
   const [importAccounts, setImportAccounts] = useState(null);
-  const [autoRefill, setAutoRefill] = useState(true);
+  const [autoRefill, setAutoRefill] = useState(false);
   const [threshold, setThreshold] = useState(10);
   const [checkInterval, setCheckInterval] = useState(60);
   const [concurrency, setConcurrency] = useState(3);
@@ -740,7 +742,7 @@ function App({ onLogout }) {
       if (!cancelled) {
         applyStatePayload(payload, setChildren, setMothers, setServerTeams);
         if (payload.settings) {
-          setAutoRefill(payload.settings.autoRefill !== false);
+          setAutoRefill(payload.settings.autoRefill === true);
           setThreshold(Number(payload.settings.threshold) || 10);
           setCheckInterval(Number(payload.settings.checkInterval) || 60);
           setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
@@ -754,7 +756,7 @@ function App({ onLogout }) {
           setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
           setIntegrations((current) => mergedIntegrations(current, payload.settings.integrations));
           setProxySettings((current) => ({ ...current, ...(payload.settings.proxy || {}), entries: Array.isArray(payload.settings.proxy?.entries) ? payload.settings.proxy.entries : current.entries }));
-          setIsRunning(Boolean(payload.mothers?.length) && payload.settings.autoRefill !== false);
+          setIsRunning(Boolean(payload.mothers?.length) && payload.settings.autoRefill === true);
         }
       }
     }).catch(() => {
@@ -960,7 +962,7 @@ function App({ onLogout }) {
       applyStatePayload(payload, setChildren, setMothers, setServerTeams);
       setHistoryReloadKey((value) => value + 1);
       if (payload.settings) {
-        setAutoRefill(payload.settings.autoRefill !== false);
+        setAutoRefill(payload.settings.autoRefill === true);
         setThreshold(Number(payload.settings.threshold) || 10);
         setCheckInterval(Number(payload.settings.checkInterval) || 60);
         setConcurrency(Math.min(10, Math.max(1, Number(payload.settings.concurrency) || 3)));
@@ -974,7 +976,7 @@ function App({ onLogout }) {
         setPromoteJoinedAccounts(payload.settings.promoteJoinedAccounts !== false);
         setIntegrations((current) => mergedIntegrations(current, payload.settings.integrations));
         setProxySettings((current) => ({ ...current, ...(payload.settings.proxy || {}), entries: Array.isArray(payload.settings.proxy?.entries) ? payload.settings.proxy.entries : current.entries }));
-        setIsRunning(Boolean(payload.mothers?.length) && payload.settings.autoRefill !== false);
+        setIsRunning(Boolean(payload.mothers?.length) && payload.settings.autoRefill === true);
       }
       return payload;
     } catch (error) {
@@ -1036,20 +1038,14 @@ function App({ onLogout }) {
       await refreshState(false);
       setProgress(100); setLastSync('刚刚'); setStage('refill');
       const checked = result.checked ?? result.results?.length ?? 0;
-      const quotaResults = allTeams
-        ? (result.teams || []).flatMap((team) => team.results || [])
-        : (result.results || []);
-      const recoveries = quotaResults.map((item) => item.tokenRecovery).filter(Boolean);
+      const teamResults = allTeams ? (result.teams || []) : [result];
+      const quotaResults = teamResults.flatMap((team) => team.results || []);
       const recovered = quotaResults.filter((item) => item.tokenRecovery?.ok && item.ok === true).length;
-      const waitingForLogin = recoveries.filter((item) => !item.ok && (item.needsInput || item.browserRequired)).length;
-      const failedRecovery = recoveries.find((item) => !item.ok);
-      const recoveryDetail = recovered
-        ? `；已自动更新 ${recovered} 个 Team JSON`
-        : waitingForLogin
-          ? `；${waitingForLogin} 个账号需要完成登录验证后重试`
-          : recoveries.length
-            ? `；OAuth 已自动重登但未恢复${failedRecovery?.message ? `：${failedRecovery.message}` : '，请检查 Free 账号凭据'}`
-            : '';
+      const waitingForLogin = quotaResults.filter((item) => item.authorizationRequired).length;
+      const managerNeedsLogin = teamResults.some((team) => team.managerAuthorizationRequired);
+      const recoveryDetail = `${recovered ? `；已刷新 ${recovered} 个账号的现有 Team 授权` : ''}${waitingForLogin || managerNeedsLogin
+        ? `；${waitingForLogin ? `${waitingForLogin} 个账号` : 'Team 管理账号'}授权缺失或无法刷新，请到 Free 账号管理获取 Team JSON`
+        : ''}`;
       if (result.ok === false) { const message = `${allTeams ? '多 Team 检测部分失败' : '检测部分失败'}，已检查 ${allTeams ? `${result.succeeded || 0}/${result.teamCount || mothers.length} 个 Team，` : ''}${checked} 个账号${recoveryDetail}`; finishTask(taskId, 'partial', message, result); notify(message, 'error'); }
       else { const message = `${allTeams ? `全部 ${result.teamCount || mothers.length} 个 Team` : '检测'}完成，已检查 ${checked} 个账号`; finishTask(taskId, 'completed', message, result); notify(message); }
     } catch (error) {
@@ -1154,7 +1150,7 @@ function App({ onLogout }) {
     setAutoRefill(next);
     try {
       await apiRequest('/api/settings', { method: 'PATCH', body: JSON.stringify({ autoRefill: next }) });
-      notify(next ? '自动化已恢复' : '自动化已暂停', 'info');
+      notify(next ? '自动化已开启' : '自动化已暂停', 'info');
     } catch (error) {
       setIsRunning(!next);
       setAutoRefill(!next);
@@ -1962,13 +1958,14 @@ function App({ onLogout }) {
       <div className="sidebar-actions"><button className="icon-button theme-toggle" title={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} aria-label={theme === 'dark' ? '切换为白天模式' : '切换为黑夜模式'} onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button><button className="icon-button" title="快捷获取 JSON" aria-label="快捷获取 JSON" onClick={() => setShowQuickJson(true)}><Wrench size={18} /></button><button className="icon-button" title="Agent 接入与功能说明" aria-label="Agent 接入与功能说明" onClick={() => setShowAgentHelp(true)}><CircleHelp size={18} /></button><button className="icon-button" title="退出登录" aria-label="退出登录" onClick={() => onLogout().catch((error) => notify(`退出失败：${error.message}`, 'error'))}><LogOut size={18} /></button><div className="avatar" title="当前用户">AL</div></div>
     </aside>
 
-    <main className={`main-content ${view === 'run' ? 'home-content' : view === 'integrations' ? 'integrations-content' : ['vault', 'mailbox'].includes(view) ? 'vault-content' : ''}`}>
-      <div className="page-heading"><div><div className="breadcrumb"><span>我的工作区</span><ChevronRight size={14} /><strong>{view === 'run' ? '首页' : navItems.find((item) => item.id === view)?.label}</strong></div><h1>{view === 'run' ? 'Team 配额自动化' : navItems.find((item) => item.id === view)?.label}</h1><p>{view === 'run' ? '持续监控 Team 席位与账号额度，自动完成移除和补位。' : view === 'teams' ? '管理 Team 所有者、席位和当前成员。' : view === 'free' ? '维护账号凭据、加入过的 Team 和 Sub2API 状态。' : view === 'vault' ? '存放母号账号、密码、2FA、备注和备注时间。' : view === 'mailbox' ? '独立管理邮箱账号、密码和 2FA，批量导入与导出。' : view === 'integrations' ? '管理服务连接、代理池与 Roxy 自动授权参数。' : view === 'exports' ? '选择已保存的账号授权，按账号或 Team 导出 JSON。' : '集中管理自动检测和操作记录。'}</p></div>{!['vault', 'mailbox'].includes(view) && <div className="heading-actions"><span className={isRunning ? 'live-badge on' : 'live-badge'}><i />{isRunning ? 'Live' : 'Paused'}</span><button className="button ghost" onClick={toggleAutomation}>{isRunning ? <Pause size={15} /> : <Play size={15} />}{isRunning ? '暂停' : '恢复'}</button><button className="button primary" onClick={syncNow}><RefreshCw size={15} />同步进度</button></div>}</div>
+    <main className={`main-content ${view === 'run' ? 'home-content' : view === 'integrations' ? 'integrations-content' : view === 'guide' ? 'guide-content' : ['vault', 'mailbox'].includes(view) ? 'vault-content' : ''}`}>
+      <div className="page-heading"><div><div className="breadcrumb"><span>我的工作区</span><ChevronRight size={14} /><strong>{view === 'run' ? '首页' : navItems.find((item) => item.id === view)?.label}</strong></div><h1>{view === 'run' ? 'Team 配额自动化' : navItems.find((item) => item.id === view)?.label}</h1><p>{view === 'run' ? '持续监控 Team 席位与账号额度，自动完成移除和补位。' : view === 'teams' ? '管理 Team 所有者、席位和当前成员。' : view === 'free' ? '维护账号凭据、加入过的 Team 和 Sub2API 状态。' : view === 'vault' ? '存放母号账号、密码、2FA、备注和备注时间。' : view === 'mailbox' ? '独立管理邮箱账号、密码和 2FA，批量导入与导出。' : view === 'integrations' ? '管理服务连接、代理池与 Roxy 自动授权参数。' : view === 'exports' ? '选择已保存的账号授权，按账号或 Team 导出 JSON。' : view === 'guide' ? '从导入账号到获取 Team JSON，按步骤完成配置与日常操作。' : '集中管理自动检测和操作记录。'}</p></div>{!['vault', 'mailbox', 'guide'].includes(view) && <div className="heading-actions"><span className={isRunning ? 'live-badge on' : 'live-badge'}><i />{isRunning ? 'Live' : 'Paused'}</span><button type="button" className="button ghost" onClick={toggleAutomation}>{isRunning ? <Pause size={15} /> : <Play size={15} />}{isRunning ? '暂停' : '自动化开启'}</button><button className="button primary" onClick={syncNow}><RefreshCw size={15} />同步进度</button></div>}</div>
 
       {view === 'run' && <RunView activeMother={activeMother} activeSeatStats={activeSeatStats} activeChildren={activeChildren} trackedChildren={trackedChildren} readyChildren={readyChildren} pendingTeamAuthChildren={pendingTeamAuthChildren} exhausted={exhausted} canRefillAll={anyExhausted || anyOpenSeat || anyPendingTeamAuth || kickWindow === 'time'} lowQuota={lowQuota} seatsOpen={seatsOpen} stage={stage} progress={progress} isRunning={isRunning} isProcessing={isProcessing} lastSync={lastSync} runCheck={runCheck} refillSeats={refillSeats} setShowMother={() => openMother(activeMother)} setSelectedTeam={setSelectedTeam} mothers={mothers} autoRefill={autoRefill} joinMode={effectiveJoinMode} />}
       {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} openBillingPreviews={openBillingPreviews} billingPreviewLoading={billingPreviewLoading} />}
       {view === 'vault' && <MotherVaultView apiRequest={apiRequest} notify={notify} />}
       {view === 'mailbox' && <MailboxVaultView apiRequest={apiRequest} notify={notify} />}
+      {view === 'guide' && <UserGuideView onNavigate={(target) => { if (target === 'exports') openAccountExports(); else setView(target); window.scrollTo(0, 0); }} />}
       {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} loading={isProcessing} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteLocalAccounts={batchDeleteLocalAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} submitAccountCallback={submitAccountCallback} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} autoJson={autoJson} startAutoJson={startAutoJson} jsonMotherId={jsonMotherId} setJsonMotherId={setJsonMotherId} roxyEnabled={integrations.roxy?.enabled === true} roxyConcurrency={integrations.roxy?.concurrency || 1} roxyConcurrencySaving={roxyConcurrencySaving} saveRoxyConcurrency={saveRoxyConcurrency} refreshTeamQuota={refreshTeamQuota} quotaRefreshStates={quotaRefreshStates} batchQuota={batchQuota} refreshAllTeamQuotas={refreshAllTeamQuotas} batchRemoval={batchRemoval} openBatchRemoval={(motherId) => setBatchRemovalDialog({ motherId })} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} onSelect={setSelectedHistory} />}
       {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} joinMode={joinMode} setJoinMode={setJoinMode} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} delayedKickEnabled={delayedKickEnabled} setDelayedKickEnabled={setDelayedKickEnabled} delayedKickMinutes={delayedKickMinutes} setDelayedKickMinutes={setDelayedKickMinutes} saveSettings={saveSettings} versionInfo={versionInfo} />}
