@@ -16,7 +16,11 @@ export default function RoxyIntegrationForm({ config = {}, accounts = [], proxyS
     enabled: config.enabled === true,
     headless: config.headless === true,
     useProxyPool: config.useProxyPool === true,
+    deleteProfileAfterSuccess: config.deleteProfileAfterSuccess === true,
+    deleteProfileAfterFailure: config.deleteProfileAfterFailure === true,
     concurrency: [1, 2, 3].includes(config.concurrency) ? config.concurrency : 1,
+    profileMode: config.profileMode === 'pooled' ? 'pooled' : 'dedicated',
+    poolSize: [1, 2, 3].includes(config.poolSize) ? config.poolSize : 3,
     baseUrl: config.baseUrl || DEFAULT_BASE_URL,
     apiKey: '',
     apiKeySet: config.apiKeySet === true,
@@ -30,7 +34,7 @@ export default function RoxyIntegrationForm({ config = {}, accounts = [], proxyS
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [checkedWorkspace, setCheckedWorkspace] = useState(null);
-  const savedConfig = JSON.stringify({ enabled: config.enabled === true, headless: config.headless === true, useProxyPool: config.useProxyPool === true, concurrency: [1, 2, 3].includes(config.concurrency) ? config.concurrency : 1, baseUrl: config.baseUrl || DEFAULT_BASE_URL, apiKeySet: config.apiKeySet === true, workspaceId: config.workspaceId || '', profiles: normalizeProfiles(config.profiles) });
+  const savedConfig = JSON.stringify({ enabled: config.enabled === true, headless: config.headless === true, useProxyPool: config.useProxyPool === true, deleteProfileAfterSuccess: config.deleteProfileAfterSuccess === true, deleteProfileAfterFailure: config.deleteProfileAfterFailure === true, concurrency: [1, 2, 3].includes(config.concurrency) ? config.concurrency : 1, profileMode: config.profileMode === 'pooled' ? 'pooled' : 'dedicated', poolSize: [1, 2, 3].includes(config.poolSize) ? config.poolSize : 3, baseUrl: config.baseUrl || DEFAULT_BASE_URL, apiKeySet: config.apiKeySet === true, workspaceId: config.workspaceId || '', profiles: normalizeProfiles(config.profiles) });
 
   useEffect(() => {
     setForm({ ...JSON.parse(savedConfig), apiKey: '' });
@@ -40,13 +44,15 @@ export default function RoxyIntegrationForm({ config = {}, accounts = [], proxyS
   const proxyEntries = Array.isArray(proxySettings.entries) ? proxySettings.entries : [];
   const proxyPoolProblem = !proxySettings.enabled ? '工具代理池尚未启用，请先在「代理池」中启用并保存。' : !proxyEntries.length ? '代理池为空，请先添加代理。' : '';
   const usedDirIds = new Set(form.profiles.map((item) => item.dirId));
+  const pooled = form.profileMode === 'pooled';
+  const effectiveConcurrency = pooled ? Math.min(form.concurrency, form.poolSize) : form.concurrency;
   const update = (key, value) => { setForm((current) => ({ ...current, [key]: value })); setMessage(''); setError(''); };
 
   async function checkConnection() {
     if (checking) return;
     setChecking(true); setError(''); setMessage('');
     try {
-      const next = { enabled: form.enabled, headless: form.headless, useProxyPool: form.useProxyPool, concurrency: form.concurrency, baseUrl: form.baseUrl.trim(), workspaceId: form.workspaceId, profiles: form.profiles };
+      const next = { enabled: form.enabled, headless: form.headless, useProxyPool: form.useProxyPool, deleteProfileAfterSuccess: form.deleteProfileAfterSuccess, deleteProfileAfterFailure: form.deleteProfileAfterFailure, concurrency: form.concurrency, profileMode: form.profileMode, poolSize: form.poolSize, baseUrl: form.baseUrl.trim(), workspaceId: form.workspaceId, profiles: form.profiles };
       if (form.apiKey.trim()) next.apiKey = form.apiKey.trim();
       const payload = await onCheck(next);
       if (payload?.ok === false) throw new Error(payload.message || 'Roxy 连接失败');
@@ -70,7 +76,7 @@ export default function RoxyIntegrationForm({ config = {}, accounts = [], proxyS
   }
 
   function changeWorkspace(workspaceId) {
-    if (form.profiles.length && !window.confirm('切换 Roxy 工作空间会清除当前窗口映射，确认切换？')) return;
+    if ((form.profiles.length || config.poolProfiles?.length) && !window.confirm('切换 Roxy 工作空间会清除当前窗口映射，确认切换？')) return;
     setForm((current) => ({ ...current, workspaceId, profiles: [] }));
     setRemoteProfiles([]); setCheckedWorkspace(null); setError(''); setMessage('');
   }
@@ -89,9 +95,9 @@ export default function RoxyIntegrationForm({ config = {}, accounts = [], proxyS
       if (!item.dirId || seen.has(item.dirId)) return true;
       seen.add(item.dirId); return false;
     });
-    if (duplicate) { setSaving(false); setError('同一个 Roxy 窗口不能分配给多个账号'); return; }
+    if (!pooled && duplicate) { setSaving(false); setError('同一个 Roxy 窗口不能分配给多个账号'); return; }
     try {
-      const next = { enabled: form.enabled, headless: form.headless, useProxyPool: form.useProxyPool, concurrency: form.concurrency, baseUrl: form.baseUrl.trim() || DEFAULT_BASE_URL, workspaceId: form.workspaceId.trim(), profiles: normalizeProfiles(form.profiles) };
+      const next = { enabled: form.enabled, headless: form.headless, useProxyPool: form.useProxyPool, deleteProfileAfterSuccess: form.deleteProfileAfterSuccess, deleteProfileAfterFailure: form.deleteProfileAfterFailure, concurrency: form.concurrency, profileMode: form.profileMode, poolSize: form.poolSize, baseUrl: form.baseUrl.trim() || DEFAULT_BASE_URL, workspaceId: form.workspaceId.trim(), profiles: normalizeProfiles(form.profiles) };
       if (form.apiKey.trim()) next.apiKey = form.apiKey.trim();
       const saved = await onSave(next);
       if (saved === false) { setError('Roxy 配置未保存'); return; }
@@ -109,15 +115,25 @@ export default function RoxyIntegrationForm({ config = {}, accounts = [], proxyS
       <label className="wide"><span>Roxy 工作空间</span><select className="select-control" value={form.workspaceId} disabled={checking || saving} onChange={(event) => changeWorkspace(event.target.value)}><option value="">请选择工作空间</option>{form.workspaceId && !workspaces.some((item) => String(item.id) === String(form.workspaceId)) && <option value={form.workspaceId}>{form.workspaceId}（已保存）</option>}{workspaces.map((item) => <option key={item.id} value={item.id}>{item.name || item.id} · {item.id}</option>)}</select></label>
       <label className="integration-enabled wide"><span>自动授权使用 Roxy</span><button type="button" className={`toggle ${form.enabled ? 'checked' : ''}`} disabled={checking || saving} onClick={() => update('enabled', !form.enabled)} aria-pressed={form.enabled} aria-label={form.enabled ? '关闭 Roxy 自动授权' : '开启 Roxy 自动授权'}><span /></button></label>
       <label className="wide"><span>浏览器启动方式</span><select className="select-control" value={form.headless ? 'headless' : 'headed'} disabled={checking || saving} onChange={(event) => update('headless', event.target.value === 'headless')}><option value="headed">有头 · 实际打开浏览器</option><option value="headless">无头 · 后台运行</option></select><small className="roxy-field-note">无头模式是否生效取决于 Roxy 版本 / 内核。</small></label>
-      <label className="wide"><span>Roxy 浏览器并发数</span><select className="select-control" aria-label="Roxy 浏览器并发数" value={form.concurrency} disabled={checking || saving} onChange={(event) => update('concurrency', Number(event.target.value))}><option value={1}>1 个 · 逐个执行（默认）</option><option value={2}>2 个 · 同时执行</option><option value={3}>3 个 · 同时执行</option></select><small className="roxy-field-note">最多同时执行 3 个账号；完成一个后自动接着下一个。与 Free 账号管理页共用此设置。</small></label>
+      <label className="wide"><span>账号环境模式</span><select className="select-control" aria-label="账号环境模式" value={form.profileMode} disabled={checking || saving} onChange={(event) => update('profileMode', event.target.value)}><option value="dedicated">一号一环境 · 保留独立登录状态</option><option value="pooled">复用环境 · 每次隔离登录会话</option></select><small className="roxy-field-note">{pooled ? '适合环境数量有限的 Roxy 套餐，账号按空闲环境排队执行。' : '每个账号使用自己的固定环境，首次授权时自动创建。'}</small></label>
+      {pooled && <label className="wide"><span>最多授权环境数</span><select className="select-control" aria-label="最多复用环境数" value={form.poolSize} disabled={checking || saving} onChange={(event) => update('poolSize', Number(event.target.value))}><option value={1}>1 个环境</option><option value={2}>2 个环境</option><option value={3}>3 个环境</option></select><small className="roxy-field-note">最多使用 {form.poolSize} 个授权环境，账号按空闲名额排队。</small></label>}
+      <label className="integration-enabled wide"><span>成功后释放环境名额</span><button type="button" className={`toggle ${form.deleteProfileAfterSuccess ? 'checked' : ''}`} disabled={checking || saving} onClick={() => update('deleteProfileAfterSuccess', !form.deleteProfileAfterSuccess)} aria-pressed={form.deleteProfileAfterSuccess} aria-label="成功后释放环境名额"><span /></button></label>
+      <label className="integration-enabled wide"><span>失败后释放环境名额</span><button type="button" className={`toggle ${form.deleteProfileAfterFailure ? 'checked' : ''}`} disabled={checking || saving} onClick={() => update('deleteProfileAfterFailure', !form.deleteProfileAfterFailure)} aria-pressed={form.deleteProfileAfterFailure} aria-label="失败后释放环境名额"><span /></button></label>
+      <label className="wide"><span>Roxy 浏览器并发数</span><select className="select-control" aria-label="Roxy 浏览器并发数" value={form.concurrency} disabled={checking || saving} onChange={(event) => update('concurrency', Number(event.target.value))}><option value={1}>1 个 · 逐个执行（默认）</option><option value={2}>2 个 · 同时执行</option><option value={3}>3 个 · 同时执行</option></select><small className="roxy-field-note">{pooled ? `当前最多同时执行 ${effectiveConcurrency} 个账号，实际并发不超过环境数；完成一个后接着下一个。` : '最多同时执行 3 个账号；完成一个后自动接着下一个。'}与 Free 账号管理页共用此设置。</small></label>
       <label className="integration-enabled wide"><span>使用工具代理池</span><button type="button" className={`toggle ${form.useProxyPool ? 'checked' : ''}`} disabled={checking || saving} onClick={() => update('useProxyPool', !form.useProxyPool)} aria-pressed={form.useProxyPool} aria-label={form.useProxyPool ? '关闭 Roxy 使用工具代理池' : '开启 Roxy 使用工具代理池'}><span /></button></label>
     </div>
-    <p className={`roxy-profile-note ${form.useProxyPool && proxyPoolProblem ? 'roxy-pool-warning' : ''}`} role={form.useProxyPool && proxyPoolProblem ? 'status' : undefined}>{form.useProxyPool ? proxyPoolProblem || `代理池已启用，共 ${proxyEntries.length} 条。启动时使用账号绑定的代理，自动分配后保持固定；连接状态以实际授权结果为准。` : '使用 Roxy 窗口原有网络配置。开启代理池后，浏览器与本次授权请求使用同一条代理。'}</p>
+    <p className="roxy-profile-note">{form.deleteProfileAfterFailure ? '授权失败或需要人工验证时，确认窗口关闭后将本工具创建的环境移入回收站。账号和错误日志保留，任务结束后可在运行日志中重试。释放失败会明确提示。' : '开启“失败后释放环境名额”后，失败账号的授权环境也会移入回收站，释放窗口用量；账号资料和错误日志仍然保留。'}</p>
+    <p className={`roxy-profile-note ${form.useProxyPool && proxyPoolProblem ? 'roxy-pool-warning' : ''}`} role={form.useProxyPool && proxyPoolProblem ? 'status' : undefined}>{form.useProxyPool ? proxyPoolProblem || `代理池已启用，共 ${proxyEntries.length} 条。自动分配代理，连接失败时先关闭窗口再换下一条，每账号最多尝试 3 条；成功代理保留供后续请求使用。密码错误、官方验证或 Roxy 启动错误不会触发换代理。` : '使用 Roxy 窗口原有网络配置。开启代理池后，浏览器与本次授权请求使用同一条代理。'}</p>
     <div className="roxy-actions"><button type="button" className="button ghost" onClick={checkConnection} disabled={checking || saving || !form.baseUrl.trim()}><RefreshCw size={14} className={checking ? 'button-spinner' : ''} />{checking ? '检查中' : '检查连接'}</button><button type="button" className="button primary" onClick={save} disabled={saving || checking}><Check size={14} />{saving ? '保存中' : '保存配置'}</button></div>
     {error && <div className="roxy-feedback error"><X size={14} />{error}</div>}
     {message && <div className="roxy-feedback success"><Check size={14} />{message}</div>}
+    {pooled ? <>
+      <div className="roxy-mapping-head"><strong>{form.deleteProfileAfterSuccess && form.deleteProfileAfterFailure ? '账号环境 · 完成后释放' : form.deleteProfileAfterSuccess ? '账号环境 · 成功后释放' : form.deleteProfileAfterFailure ? '账号环境 · 失败后释放' : '账号环境 · 自动复用'}</strong><span>最多 {form.poolSize} 个环境 · 同时执行 {effectiveConcurrency} 个账号</span></div>
+      <p className="roxy-profile-note">启动前核验环境，旧绑定失效时重新分配空闲环境。每个账号使用隔离登录会话，成功或失败后确认窗口关闭，再继续下一个。{form.useProxyPool && '代理连接失败最多尝试 3 条，浏览器与兑换 JSON 始终使用同一条代理。'}</p>
+      <p className="roxy-profile-note">{form.deleteProfileAfterSuccess ? 'JSON 核验并保存后，自动关闭本次授权环境并移入 Roxy 回收站，释放“窗口用量”；本机 JSON 和账号代理保留。下次需要浏览器授权时重新分配环境。' : 'Roxy 的“窗口用量”统计已保存的环境。开启“成功后释放环境名额”，可在 JSON 保存成功后将本工具的授权环境移入回收站。'}</p>
+    </> : <>
     <div className="roxy-mapping-head"><strong>账号环境 · 一号一窗口</strong><span>{form.profiles.length} 个已绑定 · {checkedWorkspace ? `${remoteProfiles.length} 个可选窗口` : '首次授权时自动绑定'}</span></div>
-    <p className="roxy-profile-note">首次自动授权时，为未绑定账号创建并保存独立窗口；后续复用自己的登录状态。也可检查连接后手动指定窗口，同一窗口不能分配给多个账号。</p>
+    <p className="roxy-profile-note">{form.deleteProfileAfterSuccess ? 'JSON 保存成功后关闭环境并移入 Roxy 回收站，释放名额；本机 JSON 保留。仅清理本工具创建的环境，手动绑定的其他环境保留。' : '首次自动授权时，为未绑定账号创建并保存独立窗口；后续复用自己的登录状态。也可检查连接后手动指定窗口，同一窗口不能分配给多个账号。'}</p>
     {!accountOptions.length && <div className="roxy-empty">暂无 Free 账号</div>}
     <div className="roxy-mappings">{accountOptions.map((account) => {
       const mapping = form.profiles.find((item) => item.childId === account.id);
@@ -131,5 +147,6 @@ export default function RoxyIntegrationForm({ config = {}, accounts = [], proxyS
         </div>
       </div>;
     })}</div>
+    </>}
   </section>;
 }

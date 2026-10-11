@@ -20,6 +20,9 @@ body:has(.mother-vault) { min-width: 320px; }
 .mother-vault-table { min-width: 850px; table-layout: fixed; }
 .mother-vault-table th, .mother-vault-table td { padding: 14px 10px; vertical-align: middle; }
 .mother-vault-table th { white-space: nowrap; }
+.mother-vault-date-sort { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; border-radius: 3px; }
+.mother-vault-date-sort:hover { color: #269569; }
+.mother-vault-date-sort:focus-visible { outline: 2px solid #28b37d; outline-offset: 4px; }
 .mother-vault-table .mother-vault-check { width: 30px; padding-left: 2px; padding-right: 2px; }
 .mother-vault-table th:nth-child(2) { width: 23%; }
 .mother-vault-table th:nth-child(3), .mother-vault-table th:nth-child(4) { width: 16%; }
@@ -74,6 +77,7 @@ html[data-theme='dark'] .mother-vault-selection-bar label, html[data-theme='dark
 html[data-theme='dark'] .mother-vault-note, html[data-theme='dark'] .mother-vault-time { color: #a2b1bf; }
 html[data-theme='dark'] .mother-vault-selected { background: #19362c; }
 html[data-theme='dark'] .mother-vault-clear { color: #71d2a7; }
+html[data-theme='dark'] .mother-vault-date-sort:hover { color: #71d2a7; }
 html[data-theme='dark'] .mother-vault-export-format { background: #15232e; border-color: #354552; color: #d4dee5; }
 html[data-theme='dark'] .mother-vault-icon:hover:not(:disabled) { background: #213d32; color: #71d2a7; }
 html[data-theme='dark'] .mother-vault .mother-vault-danger { color: #e79d9d; }

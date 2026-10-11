@@ -9,8 +9,11 @@ import {
   Sparkles, Sun, Trash2, UserMinus, UserRound, Users, Wrench, X, Zap
 } from 'lucide-react';
 import { groupTeamAccounts, teamRecordsShareIdentity } from '../shared/team-members.mjs';
-import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamMemberRemovalState } from '../shared/team-workflow-ui.mjs';
+import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamMemberRemovalState, teamAutoJsonCandidates, teamAutoJsonRowTarget } from '../shared/team-workflow-ui.mjs';
 import { teamQuotaState } from '../shared/team-quota-ui.mjs';
+import { teamQuotaBatchTargets } from '../shared/team-quota-batch.mjs';
+import { teamMemberRemovalCandidates, runTeamMemberRemovalBatch } from '../shared/team-member-removal-batch.mjs';
+import BulkMemberRemovalModal from './BulkMemberRemovalModal.jsx';
 import TeamInviteForm from './TeamInviteForm.jsx';
 import RoxyIntegrationForm from './RoxyIntegrationForm.jsx';
 import AccountExportsView from './AccountExportsView.jsx';
@@ -682,8 +685,13 @@ function App({ onLogout }) {
   const [roxyConcurrencySaving, setRoxyConcurrencySaving] = useState(false);
   const roxyConcurrencySaveRef = useRef(false);
   const [quotaRefreshStates, setQuotaRefreshStates] = useState({});
-  const quotaRefreshPending = useRef(new Set());
+  const quotaRefreshPending = useRef(new Map());
+  const [batchQuota, setBatchQuota] = useState({ loading: false, total: 0, completed: 0, succeeded: 0, failed: 0, results: [], scopeLabel: '', error: '' });
+  const batchQuotaPending = useRef(false);
   const memberRemovalPending = useRef(new Set());
+  const [batchRemoval, setBatchRemoval] = useState({ loading: false, total: 0, completed: 0, succeeded: 0, failed: 0, results: [], error: '' });
+  const batchRemovalPending = useRef(false);
+  const [batchRemovalDialog, setBatchRemovalDialog] = useState(null);
   const [proxySettings, setProxySettings] = useState(defaultProxySettings);
   const [versionInfo, setVersionInfo] = useState(null);
   const [showProxy, setShowProxy] = useState(false);
@@ -1050,23 +1058,70 @@ function App({ onLogout }) {
     } finally { setProcessingCount((count) => Math.max(0, count - 1)); }
   }
 
-  async function refreshTeamQuota(childId, motherId, workspaceId) {
+  async function refreshTeamQuota(childId, motherId, workspaceId, { silent = false, skipStateRefresh = false } = {}) {
     const key = JSON.stringify([childId, motherId, workspaceId]);
-    if (quotaRefreshPending.current.has(key)) return;
-    quotaRefreshPending.current.add(key);
+    const requestKey = JSON.stringify([childId, String(workspaceId || '').trim().toLowerCase()]);
+    const pending = quotaRefreshPending.current.get(requestKey);
+    if (pending) {
+      pending.keys.add(key);
+      pending.notify ||= !silent;
+      pending.sync ||= !skipStateRefresh;
+      setQuotaRefreshStates((current) => ({ ...current, [key]: { loading: true, error: '' } }));
+      return pending.promise;
+    }
     setQuotaRefreshStates((current) => ({ ...current, [key]: { loading: true, error: '' } }));
-    let failure = '';
-    try {
-      const result = await apiRequest(`/api/children/${encodeURIComponent(childId)}/team-quota`, {
-        method: 'POST', body: JSON.stringify({ motherId, workspaceId }),
+    const operation = { keys: new Set([key]), notify: !silent, sync: !skipStateRefresh, promise: null };
+    operation.promise = (async () => {
+      let failure = '';
+      let syncError = '';
+      try {
+        const result = await apiRequest(`/api/children/${encodeURIComponent(childId)}/team-quota`, {
+          method: 'POST', body: JSON.stringify({ motherId, workspaceId }),
+        });
+        if (result.ok === false) failure = result.message || '额度检测失败';
+      } catch (error) { failure = error.message || '额度刷新失败，请重试'; }
+      if (operation.sync) {
+        try { await refreshState(false); }
+        catch { syncError = '额度已检测，但页面同步失败，请点击同步进度'; }
+      }
+      quotaRefreshPending.current.delete(requestKey);
+      setQuotaRefreshStates((current) => {
+        const next = { ...current };
+        for (const stateKey of operation.keys) next[stateKey] = { loading: false, error: failure || syncError };
+        return next;
       });
-      if (result.ok === false) failure = result.message || '额度检测失败';
-    } catch (error) { failure = error.message || '额度刷新失败，请重试'; }
-    try { await refreshState(false); }
-    catch { if (!failure) failure = '额度已检测，但页面同步失败，请点击同步进度'; }
-    quotaRefreshPending.current.delete(key);
-    setQuotaRefreshStates((current) => ({ ...current, [key]: { loading: false, error: failure } }));
-    notify(failure || '该 Team 的真实额度已刷新', failure ? 'error' : 'success');
+      if (operation.notify) notify(failure || syncError || '该 Team 的真实额度已刷新', failure || syncError ? 'error' : 'success');
+      return { ok: !failure, error: failure, syncError };
+    })();
+    quotaRefreshPending.current.set(requestKey, operation);
+    return operation.promise;
+  }
+
+  async function refreshAllTeamQuotas(motherId = '') {
+    if (batchQuotaPending.current) return;
+    const candidates = teamQuotaBatchTargets(accountRecords, mothers, motherId);
+    if (!candidates.length) { notify('当前范围没有已获取完整 Team JSON 的在团账号', 'info'); return; }
+    batchQuotaPending.current = true;
+    const scopeLabel = motherId ? teamDisplayName(mothers.find((mother) => mother.id === motherId)) : '全部 Team';
+    const initial = { loading: true, total: candidates.length, completed: 0, succeeded: 0, failed: 0, results: [], scopeLabel, error: '' };
+    setBatchQuota(initial);
+    let summary = initial;
+    try {
+      for (const candidate of candidates) {
+        let result;
+        try { result = await refreshTeamQuota(candidate.childId, candidate.motherId, candidate.workspaceId, { silent: true, skipStateRefresh: true }); }
+        catch (error) { result = { ok: false, error: error.message || '额度刷新失败，请重试' }; }
+        const ok = result?.ok === true;
+        summary = { ...summary, completed: summary.completed + 1, succeeded: summary.succeeded + Number(ok), failed: summary.failed + Number(!ok), results: [...summary.results, { ...candidate, ok, error: result?.error || (ok ? '' : '额度刷新失败，请重试') }] };
+        setBatchQuota(summary);
+      }
+    } finally {
+      try { await refreshState(false); }
+      catch { summary = { ...summary, error: '额度检测已结束，但页面同步失败，请点击“同步进度”更新显示。' }; }
+      batchQuotaPending.current = false;
+      setBatchQuota({ ...summary, loading: false });
+      notify(`额度刷新完成：成功 ${summary.succeeded} 项，失败 ${summary.failed} 项${summary.error ? '；页面同步失败' : ''}`, summary.failed || summary.error ? 'error' : 'success');
+    }
   }
 
   async function refillSeats(motherId = null) {
@@ -1279,11 +1334,18 @@ function App({ onLogout }) {
     setView('free');
   }
 
-  async function startAutoJson(ids = [], motherId = jsonMotherId, { retryFailed = false, retryJobId = '' } = {}) {
+  async function startAutoJson(ids = [], motherId = jsonMotherId, { retryFailed = false, retryJobId = '', retryAccount = false } = {}) {
     if (autoJsonStartPending.current || roxyConcurrencySaveRef.current || autoJson.starting || ['queued', 'running'].includes(autoJson.job?.status) || batchAcquire.loading) return null;
     const mother = mothers.find((item) => item.id === motherId);
     if (!mother) { notify('请先选择要获取授权的 Team', 'info'); return null; }
-    const selectedIds = [...new Set(ids.filter(Boolean))];
+    const requestedIds = [...new Set((Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && id))];
+    if (!requestedIds.length) { notify('当前没有待获取 Team JSON 的账号', 'info'); return null; }
+    if (requestedIds.some((id) => !accountRecords.some((account) => account.id === id))) {
+      notify('所选账号已变化，请刷新账号列表后重试', 'info'); return null;
+    }
+    const selectedAccounts = teamAutoJsonCandidates(accountRecords, mother, requestedIds);
+    const selectedIds = selectedAccounts.map((account) => account.id);
+    if (!selectedIds.length) { notify('所选账号已获取目标 Team JSON，或已不属于此 Team，无需重复授权', 'info'); return null; }
     if (retryFailed) {
       const previous = [autoJson.job, ...(autoJson.history || [])].find((item) => item?.id === retryJobId);
       const retriedIds = new Set(previous?.retriedIds || []);
@@ -1296,10 +1358,14 @@ function App({ onLogout }) {
       }
     }
     autoJsonStartPending.current = true;
-    setAutoJson((current) => ({ ...current, starting: true, error: '' }));
+    setAutoJson((current) => {
+      const history = [current.job, ...(current.history || [])].filter((item) => item?.status === 'complete')
+        .filter((item, index, list) => list.findIndex((entry) => entry.id === item.id) === index).slice(0, 5);
+      return { ...current, starting: true, job: null, history, launch: { motherId, ids: selectedIds, emails: selectedAccounts.map((account) => account.email || account.id) }, error: '' };
+    });
     const taskId = createTask('acquire', retryFailed ? '重试所选 Team JSON' : '自动获取 JSON', motherId, '跳过已有 Team JSON，处理待授权账号，成功后检测额度');
     try {
-      const payload = await apiRequest('/api/children/auto-json', { method: 'POST', body: JSON.stringify({ scope: 'team', motherId, ...(selectedIds.length ? { ids: selectedIds } : {}), ...(retryFailed ? { retryFailed: true, retryJobId } : {}) }) });
+      const payload = await apiRequest('/api/children/auto-json', { method: 'POST', body: JSON.stringify({ scope: 'team', motherId, ids: selectedIds, ...(retryFailed ? { retryFailed: true, retryJobId } : {}), ...(retryAccount && selectedIds.length === 1 ? { retryAccount: true } : {}) }) });
       if (!payload.job?.id) throw new Error('服务端未返回获取任务');
       try { window.sessionStorage.setItem('auto-team-json-job', payload.job.id); } catch { /* Storage can be disabled. */ }
       setAutoJson((current) => {
@@ -1703,16 +1769,23 @@ function App({ onLogout }) {
     }
   }
 
-  async function removeChild(id, { motherId, workspaceId } = {}) {
+  async function removeChild(id, { motherId, workspaceId, expectedEmail, silent = false, skipStateRefresh = false } = {}) {
     const child = children.find((item) => item.id === id);
     if (!child || !motherId || !workspaceId) throw new Error('账号或 Team 已变化，请刷新后重试');
     if (memberRemovalPending.current.has(id)) throw new Error('此账号正在移除，请等待完成');
     memberRemovalPending.current.add(id);
     try {
-      await apiRequest(`/api/children/${encodeURIComponent(id)}/kick`, { method: 'POST', body: JSON.stringify({ motherId, workspaceId, reason: 'manual', retryAfter: null }) });
-      await refreshState(false);
-      notify(`账号已移出 ${teamNameForId(mothers, workspaceId)}，本地资料已保留`);
-      return true;
+      const account = await apiRequest(`/api/children/${encodeURIComponent(id)}/kick`, { method: 'POST', body: JSON.stringify({ motherId, workspaceId, expectedEmail: expectedEmail || child.email, reason: 'manual', retryAfter: null }) });
+      if (account.ok === false) throw new Error(account.message || '移除失败');
+      // Use the server's deletion eligibility; never infer it from one Team.
+      setChildren((current) => current.map((item) => item.id === id ? { ...item, ...account } : item));
+      let syncError = '';
+      if (!skipStateRefresh) {
+        try { await refreshState(false); }
+        catch { syncError = '成员已移除，但页面同步失败，请点击同步进度'; }
+      }
+      if (!silent) notify(syncError || `账号已移出 ${teamNameForId(mothers, workspaceId)}，本地资料已保留`, syncError ? 'error' : 'success');
+      return { ok: true, account, syncError };
     } catch (error) {
       const messages = {
         protected_workspace_member: '该成员是受保护的主号，不能移除',
@@ -1726,6 +1799,8 @@ function App({ onLogout }) {
         team_workspace_mismatch: '母号对应的空间已变化，请重新选择',
         member_email_required: '账号缺少邮箱，无法核验成员身份',
         child_identity_changed_during_kick: '账号身份已变化，请重新选择后操作',
+        child_identity_changed_before_kick: '账号邮箱已变化，请重新选择后确认移除',
+        team_kick_identity_required: '账号邮箱信息无效，请刷新后重新选择',
         child_workspace_changed_during_kick: 'Team 配置已变化，请重新选择后操作',
         team_membership_changed_during_kick: '成员关系已变化，请重新选择后操作',
         child_has_pending_seat_claim: '账号正在处理席位，请等待完成后重试',
@@ -1733,10 +1808,57 @@ function App({ onLogout }) {
         workspace_members_refresh_failed: '无法核验 Team 当前成员，请检查母号授权和网络后重试',
         workspace_member_remove_failed: 'Team 拒绝了移除请求，请检查母号管理权限后重试',
       };
-      await refreshState(false).catch(() => {});
+      if (!skipStateRefresh) await refreshState(false).catch(() => {});
       const message = messages[error.payload?.message] || error.message;
       throw new Error(error.payload?.remoteRemoved ? `${message}；远端已处理移除，请同步 Team 后核对` : message);
     } finally { memberRemovalPending.current.delete(id); }
+  }
+
+  async function batchRemoveMembers(targets) {
+    if (batchRemovalPending.current) return false;
+    if (isProcessing || batchQuotaPending.current || memberRemovalPending.current.size || localAccountDeletePending.current || batchAcquire.loading
+      || autoJson.starting || ['queued', 'running'].includes(autoJson.job?.status)) {
+      notify('请等待当前账号操作结束后再移除成员', 'error');
+      return false;
+    }
+    const selected = Array.isArray(targets) ? targets : [];
+    const motherId = selected[0]?.motherId;
+    const eligible = teamMemberRemovalCandidates(accountRecords, mothers, motherId);
+    const seen = new Set();
+    const candidates = [];
+    for (const target of selected) {
+      const current = eligible.find((item) => item.childId === target.childId && item.motherId === target.motherId
+        && item.workspaceId === target.workspaceId && item.email === target.email);
+      if (!current || acquireStates[target.childId]?.loading || memberRemovalPending.current.has(target.childId)) {
+        notify('所选账号或 Team 状态已变化，请重新选择后确认', 'error');
+        return false;
+      }
+      if (!seen.has(current.childId)) { seen.add(current.childId); candidates.push(current); }
+    }
+    if (!candidates.length) return false;
+    batchRemovalPending.current = true;
+    setProcessingCount((count) => count + 1);
+    const initial = { loading: true, total: candidates.length, completed: 0, succeeded: 0, failed: 0,
+      results: [], error: '', motherId, workspaceId: candidates[0].workspaceId };
+    setBatchRemoval(initial);
+    let summary = initial;
+    try {
+      const result = await runTeamMemberRemovalBatch(candidates,
+        (target) => removeChild(target.childId, { motherId: target.motherId, workspaceId: target.workspaceId, expectedEmail: target.email, silent: true, skipStateRefresh: true }),
+        (progress) => { summary = { ...initial, ...progress }; setBatchRemoval(summary); });
+      summary = { ...initial, ...result };
+    } catch (error) {
+      summary = { ...summary, error: error.message || '批量移除中断，请同步进度后核对结果' };
+    } finally {
+      try { await refreshState(false); }
+      catch { summary = { ...summary, error: summary.error || '移除操作已结束，但页面同步失败，请点击同步进度后核对删除状态。' }; }
+      setBatchRemoval({ ...summary, loading: false });
+      batchRemovalPending.current = false;
+      setProcessingCount((count) => Math.max(0, count - 1));
+      notify(`移除完成：成功 ${summary.succeeded} 个，失败 ${summary.failed} 个${summary.error ? '；请查看详情' : ''}`,
+        summary.failed || summary.error ? 'error' : 'success');
+    }
+    return true;
   }
 
   async function deleteFreeAccount(id) {
@@ -1847,13 +1969,18 @@ function App({ onLogout }) {
       {view === 'teams' && <TeamManagementView teams={teamRecords} openTeam={openMother} openDetail={openTeamDetail} setShowImport={() => setShowImport(true)} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} openBillingPreviews={openBillingPreviews} billingPreviewLoading={billingPreviewLoading} />}
       {view === 'vault' && <MotherVaultView apiRequest={apiRequest} notify={notify} />}
       {view === 'mailbox' && <MailboxVaultView apiRequest={apiRequest} notify={notify} />}
-      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} loading={isProcessing} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteLocalAccounts={batchDeleteLocalAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} submitAccountCallback={submitAccountCallback} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} autoJson={autoJson} startAutoJson={startAutoJson} jsonMotherId={jsonMotherId} setJsonMotherId={setJsonMotherId} roxyEnabled={integrations.roxy?.enabled === true} roxyConcurrency={integrations.roxy?.concurrency || 1} roxyConcurrencySaving={roxyConcurrencySaving} saveRoxyConcurrency={saveRoxyConcurrency} refreshTeamQuota={refreshTeamQuota} quotaRefreshStates={quotaRefreshStates} />}
+      {view === 'free' && <FreeAccountsView children={filteredAccounts} allChildren={accountRecords} mothers={mothers} loading={isProcessing} search={search} setSearch={setSearch} setShowImport={() => setShowImport(true)} addAccount={() => openAccount()} exportSub2Api={exportSub2Api} pushSub2Api={pushSub2Api} exportTeamSub2Api={exportTeamSub2Api} pushTeamSub2Api={pushTeamSub2Api} removeChild={removeChild} deleteFreeAccount={deleteFreeAccount} batchDeleteLocalAccounts={batchDeleteLocalAccounts} openJsonImport={openJsonImport} editAccount={openAccount} acquireAccount={acquireAccount} submitAccountCallback={submitAccountCallback} acquireMissingFreeJson={acquireMissingFreeJson} acquireStates={acquireStates} batchAcquire={batchAcquire} concurrency={concurrency} autoJson={autoJson} startAutoJson={startAutoJson} jsonMotherId={jsonMotherId} setJsonMotherId={setJsonMotherId} roxyEnabled={integrations.roxy?.enabled === true} roxyConcurrency={integrations.roxy?.concurrency || 1} roxyConcurrencySaving={roxyConcurrencySaving} saveRoxyConcurrency={saveRoxyConcurrency} refreshTeamQuota={refreshTeamQuota} quotaRefreshStates={quotaRefreshStates} batchQuota={batchQuota} refreshAllTeamQuotas={refreshAllTeamQuotas} batchRemoval={batchRemoval} openBatchRemoval={(motherId) => setBatchRemovalDialog({ motherId })} />}
       {view === 'history' && <HistoryView history={history} page={historyPage} pageSize={historyPageSize} meta={historyMeta} loading={historyLoading} error={historyError} onPageChange={changeHistoryPage} onPageSizeChange={changeHistoryPageSize} onRetry={reloadHistory} onSelect={setSelectedHistory} />}
       {view === 'settings' && <SettingsView autoRefill={autoRefill} setAutoRefill={setAutoRefill} promoteJoinedAccounts={promoteJoinedAccounts} setPromoteJoinedAccounts={setPromoteJoinedAccounts} joinMode={joinMode} setJoinMode={setJoinMode} threshold={threshold} setThreshold={setThreshold} checkInterval={checkInterval} setCheckInterval={setCheckInterval} concurrency={concurrency} setConcurrency={setConcurrency} kickWindow={kickWindow} setKickWindow={setKickWindow} kickAfterHours={kickAfterHours} setKickAfterHours={setKickAfterHours} delayedKickEnabled={delayedKickEnabled} setDelayedKickEnabled={setDelayedKickEnabled} delayedKickMinutes={delayedKickMinutes} setDelayedKickMinutes={setDelayedKickMinutes} saveSettings={saveSettings} versionInfo={versionInfo} />}
       {view === 'integrations' && <IntegrationsView integrations={integrations} openIntegration={setShowIntegration} proxy={proxySettings} openProxy={() => setShowProxy(true)} />}
       {view === 'exports' && <AccountExportsView key={`${exportFilter.scope}:${exportFilter.motherId}`} apiRequest={apiRequest} mothers={mothers} localAccounts={children} initialFilter={exportFilter} notify={notify} onDeleteAccounts={batchDeleteLocalAccounts} onRefreshAccounts={() => refreshState(false)} deletionBusy={isProcessing || batchAcquire.loading || autoJson.starting || ['queued', 'running'].includes(autoJson.job?.status) || Object.values(acquireStates).some((item) => item?.loading)} />}
     </main>
 
+    {batchRemovalDialog && <Modal title="一键移除成员" className="bulk-member-removal-modal" onClose={() => { if (!batchRemovalPending.current) setBatchRemovalDialog(null); }}>
+      <BulkMemberRemovalModal accounts={accountRecords} mothers={mothers} initialMotherId={batchRemovalDialog.motherId}
+        batch={batchRemoval} busy={isProcessing || batchQuota.loading || batchAcquire.loading || autoJson.starting || ['queued', 'running'].includes(autoJson.job?.status) || Object.values(acquireStates).some((item) => item?.loading)}
+        onConfirm={batchRemoveMembers} onClose={() => { if (!batchRemovalPending.current) setBatchRemovalDialog(null); }} />
+    </Modal>}
     {showImport && <Modal title="导入账号" onClose={closeImport}><div className="modal-intro">Sub2API 混合文件会按 `plan_type` 自动分流：Team 记录合并到对应空间并保留多个所有者，Free 记录进入普通账号池。完整凭据只提交服务端，不写入浏览器存储。</div><label className="file-picker"><span>选择 Sub2API JSON</span><input type="file" accept="application/json,.json" onChange={importSub2ApiFile} /><small>{importFileName || '未选择文件'}</small></label><div className="segmented">{[['email-code', '邮箱 / 接码地址'], ['password-2fa', '邮箱 / 密码 / 2FA']].map(([id, label]) => <button key={id} className={importMode === id ? 'selected' : ''} onClick={() => setImportMode(id)}>{label}</button>)}</div><textarea className="import-area" value={importText} onChange={(event) => { setImportAccounts(null); setImportFileName(''); setImportText(event.target.value); }} placeholder={importMode === 'email-code' ? 'name@example.com | sms-provider://address\nname2@example.com | https://mailbox.example/...' : 'name@example.com----password----2fa-secret'} /><div className="modal-foot"><span className="muted">{importAccounts?.length ? `${importAccounts.length} 个 JSON 账号待导入` : '支持粘贴账号信息；不会生成演示账号。'}</span><button className="button primary" onClick={importChildren}><ArrowDownToLine size={15} />开始导入</button></div></Modal>}
     {showJsonImport && <Modal title="导入 Free Sub2API JSON" onClose={() => setShowJsonImport(false)}><div className="modal-intro">账号：<strong>{jsonImportChild?.email}</strong><br />粘贴该 Free 账号完整的 Sub2API JSON，系统会保存 AT、RT 和关联字段。Team JSON 不能录入到 Free 账号。</div><textarea className="import-area" aria-label="Free Sub2API JSON" value={jsonImportText} onChange={(event) => setJsonImportText(event.target.value)} placeholder={'粘贴完整 Sub2API JSON，例如：\n{\n  "credentials": { ... }\n}'} /><div className="modal-foot"><span className="muted">完整凭据仅提交服务端保存，不会在列表中显示。</span><button className="button primary" disabled={!jsonImportText.trim() || jsonImporting} onClick={async () => { if (!jsonImportChild) return; setJsonImporting(true); try { if (await importAccountSub2Api(jsonImportChild.id, jsonImportText)) setShowJsonImport(false); } finally { setJsonImporting(false); } }}><FileText size={15} />{jsonImporting ? '导入中' : '导入 JSON'}</button></div></Modal>}
     {showMother && <MotherModal key={editingMotherId || 'new'} mother={editingMotherId ? mothers.find((item) => item.id === editingMotherId) : null} sub2apis={integrations.sub2apis || []} onClose={() => setShowMother(false)} onSave={saveMother} />}
@@ -2212,9 +2339,15 @@ function autoJsonResultLabel(item) {
   return item.status === 'failed' ? '获取失败' : item.status || '未完成';
 }
 
+function roxyCleanupLabel(cleanup) {
+  if (cleanup?.released === true) return cleanup.deleted === true ? '环境已移入回收站 · 窗口用量已释放' : '环境已不存在 · 窗口用量已释放';
+  return cleanup?.deleted === true ? '环境已回收，窗口用量释放尚未确认，请检查 Roxy' : '环境名额未释放，请检查 Roxy 后再重试';
+}
+
 function AutoJsonLogModal({ autoJson, mothers = [], mother: fallbackMother, onClose, onRetry, disabled = false, quotaDetailFor, onRefreshQuota }) {
   const [selectedRetryIds, setSelectedRetryIds] = useState([]);
-  const [retrying, setRetrying] = useState(false);
+  const [retryingIds, setRetryingIds] = useState([]);
+  const retrying = retryingIds.length > 0;
   const [retryError, setRetryError] = useState('');
   const [viewedJobId, setViewedJobId] = useState(autoJson?.job?.id || '');
   const retryPending = useRef(false);
@@ -2245,19 +2378,19 @@ function AutoJsonLogModal({ autoJson, mothers = [], mother: fallbackMother, onCl
       return next.length === current.length ? current : next;
     });
   }, [job?.id, retryableKey]);
-  async function retrySelected() {
-    if (!canRetry || retryPending.current || !selectedRetryIds.length) return;
-    const ids = selectedRetryIds.filter((id) => failedIds.includes(id));
+  async function retrySelected(requestedIds = selectedRetryIds) {
+    if (!canRetry || retryPending.current || !requestedIds.length) return;
+    const ids = [...new Set(requestedIds)].filter((id) => failedIds.includes(id));
     if (!ids.length) return;
     retryPending.current = true;
-    setRetrying(true);
+    setRetryingIds(ids);
     setRetryError('');
     try {
       const nextJob = await onRetry(ids, job.motherId, { retryFailed: true, retryJobId: job.id });
       if (!nextJob) setRetryError('重试未启动，原任务和所选账号已保留。');
     } catch (error) {
       setRetryError(`重试未启动：${error.message}`);
-    } finally { retryPending.current = false; setRetrying(false); }
+    } finally { retryPending.current = false; setRetryingIds([]); }
   }
   const stageLabels = {
     queued: '排队', job: '任务', member_check: '核验成员', free_auth: '子号登录',
@@ -2265,6 +2398,8 @@ function AutoJsonLogModal({ autoJson, mothers = [], mother: fallbackMother, onCl
     accept_invitation: '接受邀请', team_json: '保存 Team JSON', quota: '检测额度',
     completed: '完成', start: '开始登录', refresh_rt: '刷新 RT', exchange_code: '兑换授权',
     roxy_start: '打开 Roxy 窗口',
+    roxy_profile_deleting: '释放环境', roxy_profile_deleted: '环境已释放',
+    roxy_profile_delete_failed: '环境未释放', roxy_cleanup_failed: '窗口关闭失败',
   };
   const statusLabels = {
     queued: '排队中', running: '执行中', ready: '成功', needs_attention: '待验证',
@@ -2288,6 +2423,7 @@ function AutoJsonLogModal({ autoJson, mothers = [], mother: fallbackMother, onCl
         <span>额度已测 <strong>{results.filter((item) => item.quotaChecked).length}</strong></span>
         <span>待验证 <strong>{job?.needsAttention || 0}</strong></span>
         <span>失败 <strong>{job?.failed || 0}</strong></span>
+        {results.some((item) => item.roxyCleanup) && <span>环境已释放 <strong>{results.filter((item) => item.roxyCleanup?.released === true).length}</strong></span>}
       </div>
       {displayBusy && <div className="auto-json-progress" role="progressbar" aria-label="自动获取任务进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><i style={{ width: `${progress}%` }} /></div>}
       <h3 className="auto-json-log-section-title">执行日志 <span>{logs.length} 条</span></h3>
@@ -2308,9 +2444,9 @@ function AutoJsonLogModal({ autoJson, mothers = [], mother: fallbackMother, onCl
         <div className="auto-json-retry-toolbar">
           <label><input type="checkbox" aria-label="全选失败或待验证账号重试" checked={allFailedSelected} disabled={!canRetry || !failedIds.length} ref={(node) => { if (node) node.indeterminate = someFailedSelected && !allFailedSelected; }} onChange={(event) => setSelectedRetryIds(event.target.checked ? [...failedIds] : [])} />全选失败 / 待验证</label>
           <span>已选 {selectedRetryIds.length} / {failedIds.length}</span>
-          <button className="button secondary compact-button" disabled={!canRetry || !selectedRetryIds.length} onClick={retrySelected}><RefreshCw size={13} className={retrying ? 'button-spinner' : ''} />{retrying ? '正在启动' : `重试所选 (${selectedRetryIds.length})`}</button>
+          <button className="button secondary compact-button" disabled={!canRetry || !selectedRetryIds.length} onClick={() => retrySelected()}><RefreshCw size={13} className={retrying ? 'button-spinner' : ''} />{retrying ? '正在启动' : `重试所选 (${selectedRetryIds.length})`}</button>
         </div>
-        <p className="auto-json-retry-hint">{busy ? '当前批次会继续处理后续账号；任务结束后可勾选失败项重试。' : !sameWorkspace ? '此任务对应的 Team 已变化，无法在当前任务重试。' : '只重试所选失败项，成功后自动检测额度。未选项保留在原任务记录；已成功账号不重复登录。'}</p>
+        <p className="auto-json-retry-hint">{busy ? '当前批次会继续处理后续账号；任务结束后可重试失败项。' : !sameWorkspace ? '此任务对应的 Team 已变化，无法在当前任务重试。' : '可直接重试单个失败账号，也可勾选批量重试；成功后自动检测额度。原任务记录保留，已成功账号不重复登录。'}</p>
         {retryError && <p className="auto-json-log-error" role="alert">{retryError}</p>}
         <div className="auto-json-log-results">{results.map((item) => {
           const reused = autoJsonResultReused(item);
@@ -2326,7 +2462,9 @@ function AutoJsonLogModal({ autoJson, mothers = [], mother: fallbackMother, onCl
           return <div className={`auto-json-result ${resolved ? 'ready' : item.status} ${reused ? 'reused' : ''}`} key={item.id}>
             <label className="auto-json-result-select" title={retryable ? '只重试此失败或待验证账号' : successful ? '已成功的 Team JSON 不重复授权' : '此账号已提交后续重试，请切换任务记录查看'}><input type="checkbox" aria-label={`重试 ${item.email || item.id}`} checked={retryable && selectedSet.has(item.id)} disabled={!canRetry || !retryable} onChange={(event) => setSelectedRetryIds((current) => event.target.checked ? [...new Set([...current, item.id])] : current.filter((id) => id !== item.id))} /><strong>{item.email || item.id}</strong></label>
             <span>{resolved ? '后续已成功 · 无需重试' : alreadyRetried && !successful ? '已提交重试 · 请切换后续任务记录' : autoJsonResultLabel({ ...item, quotaChecked })}</span>
+            {retryable && <button className="button secondary compact-button auto-json-result-retry" disabled={!canRetry} title={busy ? '等待当前任务结束后重试' : '仅重试此账号，原失败日志保留在任务记录中'} aria-label={`重试获取 ${item.email || item.id} 的 Team JSON`} onClick={() => retrySelected([item.id])}><RefreshCw size={12} className={retryingIds.includes(item.id) ? 'button-spinner' : ''} />{retryingIds.includes(item.id) ? '正在启动' : '重试此账号'}</button>}
             <small>{resolved ? '原任务记录：' : ''}{item.message || '--'}{item.code ? ` · ${item.code}` : ''}{item.quotaHttpStatus ? ` · 额度 HTTP ${item.quotaHttpStatus}` : ''}</small>
+            {item.roxyCleanup && <small className={`auto-json-result-cleanup ${item.roxyCleanup.released === true ? 'released' : 'warning'}`}>{roxyCleanupLabel(item.roxyCleanup)}{item.roxyCleanup.code ? ` · ${item.roxyCleanup.code}` : ''}</small>}
             {hasQuota && <small>{refreshedAfterJob ? '最新额度' : reused || item.quotaCached ? '上次检测' : '剩余额度'}：5h {quota.quota5h == null ? '--' : `${quota.quota5h}%`} · 7d {quota.quota7d == null ? '--' : `${quota.quota7d}%`}{quota.updatedAt ? ` · ${taskTime(quota.updatedAt)}` : ''}</small>}
             {successful && <div className="auto-json-result-quota"><small>{reused || resolved ? '已保留成功的 Team JSON；可按需刷新真实额度。' : quotaChecked ? '授权成功，额度可单独刷新。' : 'JSON 已保存成功；额度查询未完成，可单独刷新，无需重新登录。'}</small><button className="text-button" disabled={busy || disabled || !detail?.canRefresh || detail?.refreshState?.loading} title={detail?.canRefresh ? '查询此账号在当前 Team 的真实额度' : '账号已不在当前 Team 或授权状态已变化，请刷新账号列表'} onClick={() => onRefreshQuota(item, job)}><RefreshCw size={12} className={detail?.refreshState?.loading ? 'button-spinner' : ''} />{detail?.refreshState?.loading ? '刷新中' : '刷新额度'}</button></div>}
             {detail?.refreshState?.error && <small className="auto-json-result-quota-error" role="status">{detail.refreshState.error}</small>}
@@ -2362,7 +2500,7 @@ function TeamJsonQuota({ workflow, account, onRefresh, refreshState, disabled, m
   </div>;
 }
 
-function FreeAccountsView({ children, allChildren, mothers, loading = false, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, exportTeamSub2Api, pushTeamSub2Api, removeChild, deleteFreeAccount, batchDeleteLocalAccounts, openJsonImport, editAccount, acquireAccount, submitAccountCallback, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency, autoJson, startAutoJson, jsonMotherId, setJsonMotherId, roxyEnabled = false, roxyConcurrency = 1, roxyConcurrencySaving = false, saveRoxyConcurrency, refreshTeamQuota, quotaRefreshStates = {} }) {
+function FreeAccountsView({ children, allChildren, mothers, loading = false, search, setSearch, setShowImport, addAccount, exportSub2Api, pushSub2Api, exportTeamSub2Api, pushTeamSub2Api, removeChild, deleteFreeAccount, batchDeleteLocalAccounts, openJsonImport, editAccount, acquireAccount, submitAccountCallback, acquireMissingFreeJson, acquireStates, batchAcquire, concurrency, autoJson, startAutoJson, jsonMotherId, setJsonMotherId, roxyEnabled = false, roxyConcurrency = 1, roxyConcurrencySaving = false, saveRoxyConcurrency, refreshTeamQuota, quotaRefreshStates = {}, batchQuota, refreshAllTeamQuotas, batchRemoval, openBatchRemoval }) {
   const [filter, setFilter] = useState('all');
   const [selectedAccountIds, setSelectedAccountIds] = useState([]);
   const [batchDeleting, setBatchDeleting] = useState(false);
@@ -2408,8 +2546,10 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
   ].map(([id, label]) => [id, label, scopedAccounts.filter((account) => matchesFilter(account, id)).length]);
   const countFor = (id) => filterOptions.find(([key]) => key === id)?.[2] || 0;
   const missingFreeJsonCount = allChildren.filter((account) => !isBanned(account) && !account.sub2apiStatus?.exportable).length;
-  const autoCandidates = targetMother ? allChildren.filter((account) => !isBanned(account) && workflowFor(account).related) : [];
+  const autoCandidates = targetMother ? teamAutoJsonCandidates(allChildren, targetMother) : [];
   const autoCandidateCount = autoCandidates.length;
+  const quotaCandidateCount = teamQuotaBatchTargets(allChildren, mothers, targetMother?.id || '').length;
+  const completedAutoCount = targetMother ? allChildren.filter((account) => !isBanned(account) && workflowFor(account).ready).length : 0;
   const retryVerificationCount = allChildren.filter((account) => !account.sub2apiStatus?.exportable && account.login?.browserRequired && !['waiting_code', 'phone_verification_required', 'credentials_required'].includes(account.login.status)).length;
   const automaticBusy = autoJson?.starting || ['queued', 'running'].includes(autoJson?.job?.status);
   const acquiring = automaticBusy || batchAcquire?.loading || roxyConcurrencySaving || removing || batchDeleting || singleDeleting || loading;
@@ -2431,7 +2571,7 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
     .map((item) => ({ ...item, ...teamMemberRemovalState(removalAccount, item.mother) })) : [];
   const removalTarget = removalWorkflows.find((item) => item.mother.id === removal?.motherId && item.workspaceId === removal?.workspaceId);
   const removalStale = removal && (!removalAccount || removalAccount.email !== removal.email);
-  const jobMother = mothers.find((mother) => mother.id === job?.motherId);
+  const jobMother = mothers.find((mother) => mother.id === (job?.motherId || autoJson?.launch?.motherId));
 
   useEffect(() => {
     function closeOutside(event) {
@@ -2569,13 +2709,14 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
           {mothers.map((mother) => <option key={mother.id} value={mother.id}>{teamDisplayName(mother)} · {mother.email}</option>)}
         </select>
         <span className="account-login-method">登录方式：{roxyEnabled ? `Roxy 窗口 · ${roxyConcurrency} 并发` : '纯协议'}</span>
-        <small>{!mothers.length ? '先到 Team 管理添加母号' : !targetMother ? '逐个显示各 Team 授权；批量获取、导出和推送前请选择具体 Team。' : autoCandidateCount ? `${autoCandidateCount} 个可获取账号 · 仅操作当前所选 Team` : '此 Team 暂无可获取账号，请先从母号邀请子号'}</small>
+        <small>{!mothers.length ? '先到 Team 管理添加母号' : !targetMother ? '逐个显示各 Team 授权；批量获取、导出和推送前请选择具体 Team。' : autoCandidateCount ? `${autoCandidateCount} 个待获取 · 已成功 ${completedAutoCount} 个跳过 · 仅操作当前 Team` : completedAutoCount ? `此 Team 的 ${completedAutoCount} 个账号已获取成功，无需重复授权` : '此 Team 暂无可获取账号，请先从母号邀请子号'}</small>
       </div>
       {(automaticBusy || job || autoJson?.error) && <div className="auto-json-panel" aria-live="polite">
         <div className="auto-json-summary">
           <span className="auto-json-icon"><Bot size={19} /></span>
           <div><strong>{automaticBusy ? '后台登录 → 确认入团 → 获取 Team JSON → 检测额度' : job?.status === 'complete' ? '自动获取已完成' : '自动获取任务'}</strong>
-            {job?.motherId && <span>任务 Team：{jobMother ? `${teamDisplayName(jobMother)} · ${jobMother.email}` : job.motherId}</span>}
+            {(job?.motherId || autoJson?.starting && autoJson?.launch?.motherId) && <span>任务 Team：{jobMother ? `${teamDisplayName(jobMother)} · ${jobMother.email}` : job?.motherId || autoJson?.launch?.motherId}</span>}
+            {autoJson?.starting && autoJson?.launch && <span>{autoJson.launch.ids.length === 1 ? `本次账号：${autoJson.launch.emails[0]}` : `本次仅处理 ${autoJson.launch.ids.length} 个待获取账号`}</span>}
             {job?.concurrency && <span>本次并发：{job.concurrency} 个{job.concurrency === 1 ? ' · 逐个执行' : ' · 完成后自动补充队列'}</span>}
             <span>{autoJson?.error || (job ? `已处理 ${job.completed || 0}/${job.total || 0} · JSON 成功 ${job.succeeded || 0} · 跳过重复授权 ${autoJsonReusedCount(job.results)} · 额度已测 ${(job.results || []).filter((item) => item.quotaChecked).length} · 待验证 ${job.needsAttention || 0} · 失败 ${job.failed || 0}` : '正在创建任务')}</span>
           </div>
@@ -2614,7 +2755,7 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
                 <option value={1}>1 · 逐个</option><option value={2}>2 · 同时</option><option value={3}>3 · 同时</option>
               </select>
             </label>
-            <button className="button primary" onClick={() => startAutoJson([], targetMother?.id)} disabled={acquiring || !targetMother || !autoCandidateCount} title={targetMother ? `获取 ${teamDisplayName(targetMother)} 的 Team JSON 并检测真实额度` : '请先选择具体 Team，再批量获取 JSON'}>
+            <button className="button primary" onClick={() => startAutoJson(autoCandidates.map((account) => account.id), targetMother?.id)} disabled={acquiring || !targetMother || !autoCandidateCount} title={targetMother ? `仅处理 ${autoCandidateCount} 个待获取账号；已成功账号跳过` : '请先选择具体 Team，再批量获取 JSON'}>
               <Bot size={15} />{automaticBusy ? '自动获取中' : '全自动获取 JSON'}{!automaticBusy && autoCandidateCount > 0 && <span className="button-count">{autoCandidateCount}</span>}
             </button>
           </div>
@@ -2637,8 +2778,22 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
       </div>
       <div className="bulk-delete-bar account-local-delete-bar">
         <div className="account-selection-copy"><span>显示 {visible.length} / {scopedAccounts.length} · 当前可选 {selectableVisibleIds.length} 个 · 已选 {selectedAccountIds.length} 个{selectedOutsideCount ? `（含筛选外 ${selectedOutsideCount} 个）` : ''}</span><small>可删除未授权 Free、已封禁或已移出的本地账号；仍在任何 Team 中的账号不可删除。</small></div>
-        <div className="account-selection-actions">{selectedAccountIds.length > 0 && <button className="text-button" disabled={acquiring} onClick={() => setSelectedAccountIds([])}>清空选择</button>}<button className="button danger compact-button" disabled={!selectedAccountIds.length || acquiring} onClick={deleteSelected}><Trash2 size={14} />{batchDeleting ? '正在核验删除' : `删除已选 (${selectedAccountIds.length})`}</button></div>
+        <div className="account-selection-actions">
+          {selectedAccountIds.length > 0 && <button className="text-button" disabled={acquiring} onClick={() => setSelectedAccountIds([])}>清空选择</button>}
+          <button className="button secondary compact-button" disabled={acquiring || batchQuota?.loading || !mothers.length} onClick={() => openBatchRemoval(targetMother?.id || '')} title="选择 Team 和成员，确认后批量移出，保留本地账号"><UserMinus size={14} />一键移除成员</button>
+          <button className="button secondary compact-button" disabled={acquiring || batchQuota?.loading || !quotaCandidateCount} onClick={() => refreshAllTeamQuotas(targetMother?.id || '')} title={`刷新${targetMother ? teamDisplayName(targetMother) : '全部 Team'}已获取完整 JSON 的在团账号额度，不受勾选、搜索或状态筛选影响`}><RefreshCw size={14} className={batchQuota?.loading ? 'button-spinner' : ''} />{batchQuota?.loading ? `刷新额度 ${batchQuota.completed}/${batchQuota.total}` : `一键刷新额度 (${quotaCandidateCount})`}</button>
+          <button className="button danger compact-button" disabled={!selectedAccountIds.length || acquiring} onClick={deleteSelected}><Trash2 size={14} />{batchDeleting ? '正在核验删除' : `删除已选 (${selectedAccountIds.length})`}</button>
+        </div>
       </div>
+      {batchRemoval?.total > 0 && <div className={`account-batch-quota ${batchRemoval.failed || batchRemoval.error ? 'has-errors' : ''}`}>
+        <div className="account-batch-quota-summary" role="status"><span>{batchRemoval.loading ? '正在移除成员' : '成员移除已结束'} {batchRemoval.completed}/{batchRemoval.total} · 成功 {batchRemoval.succeeded} · 失败 {batchRemoval.failed}</span><button className="text-button" onClick={() => openBatchRemoval(batchRemoval.motherId)}>查看移除结果</button></div>
+        <p>{batchRemoval.error || '已移出全部 Team 的账号可勾选后删除；仍在其他 Team 的账号需先移除其他成员关系。'}</p>
+      </div>}
+      {batchQuota?.total > 0 && <div className={`account-batch-quota ${batchQuota.failed || batchQuota.error ? 'has-errors' : ''}`}>
+        <div className="account-batch-quota-summary" role="status" aria-live="polite"><span>{batchQuota.scopeLabel} · {batchQuota.loading ? '正在刷新额度' : '额度刷新完成'} {batchQuota.completed}/{batchQuota.total}</span><span>成功 {batchQuota.succeeded} · 失败 {batchQuota.failed}</span></div>
+        {batchQuota.error && <p role="alert">{batchQuota.error}</p>}
+        {batchQuota.failed > 0 && <details><summary>查看 {batchQuota.failed} 项失败原因</summary><ul>{batchQuota.results.filter((item) => !item.ok).map((item) => <li key={JSON.stringify([item.childId, item.workspaceId])}><strong>{item.email || item.childId} · {item.teamName}</strong><span>{item.error}</span></li>)}</ul></details>}
+      </div>}
       <div className="table-wrap"><table className="data-table account-table has-bulk-selection">
         <colgroup>
           <col className="account-select-column" />
@@ -2654,6 +2809,7 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
           const historyTeams = joinedTeams.filter((entry) => entry.status !== 'active');
           const workflow = workflowFor(account);
           const teamWorkflows = workflowsFor(account);
+          const rowTarget = teamAutoJsonRowTarget(account, mothers, targetMother?.id || '');
           const storedState = acquireStates?.[account.id];
           const acquireState = storedState?.scope === 'team' && (storedState.workspaceId !== workflow.workspaceId || storedState.motherId !== targetMother?.id) ? null : storedState;
           const banned = isBanned(account);
@@ -2672,7 +2828,7 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
               {!teamWorkflows.length && <span className="muted">尚未关联 Team，请先邀请</span>}
             </div></td>
             <td className="account-membership-cell"><div className="account-membership-stack">{activeTeams.length > 0 && <div className="team-tags">{activeTeams.map((entry) => <span key={entry.team}>{teamNameForId(mothers, entry.team)}</span>)}</div>}{pendingInvitations.map((invitation) => <small className="pending-invitation-label" key={`${invitation.motherId}-${invitation.workspaceId}`}>{invitation.teamName || teamNameForId(mothers, invitation.workspaceId)} · 已邀请待加入</small>)}{!activeTeams.length && !pendingInvitations.length && <span className="muted">Free 池</span>}<details className="account-history"><summary>{joinedTeams.length} 个空间</summary>{historyTeams.length ? historyTeams.map((entry) => <small key={`${entry.team}-${entry.removedAt || entry.cooldownAt || entry.joinedAt}`}>{teamNameForId(mothers, entry.team)} · {entry.status === 'kicked' ? '已移出' : entry.status === 'cooldown' ? '冷却中' : '历史'}{entry.reason === 'account_banned' ? ' · 封禁' : entry.reason === 'manual_time_elapsed' ? ' · 手动定时退出' : entry.reason === 'time_elapsed' ? ' · 按时间轮转' : ''}{entry.retryAfter ? ` · ${teamRetryLabel(entry)}` : ''}</small>) : <small>{activeTeams.length ? '当前已加入上述空间' : '暂无加入记录'}</small>}</details></div></td>
-            <td className="account-actions-cell"><div className="account-row-actions"><div className="account-actions-primary"><button className="button secondary compact-button" disabled={banned || acquiring || !teamWorkflows.some((item) => item.related) || Boolean(storedState?.loading)} title={targetMother ? '后台登录并获取当前 Team JSON，随后检测额度' : '选择此账号要获取授权的 Team'} onClick={() => targetMother ? startAutoJson([account.id], targetMother.id) : openAccountActions(account)} aria-label={`自动获取 ${account.email || account.id} 的 JSON`}><Bot size={13} />{targetMother ? '自动获取' : '选择 Team 获取'}</button><button className="icon-button small" disabled={removing} title="更多操作" aria-label={`更多操作 ${account.email || account.id}`} onClick={() => openAccountActions(account)}><MoreHorizontal size={16} /></button></div><button className="button ghost compact-button account-remove-member" disabled={!canRemove || acquiring || Boolean(storedState?.loading)} title={canRemove ? '选择 Team 并确认移出成员，保留本地账号资料' : '暂无可移除的当前 Team 成员关系'} aria-label={`移除成员 ${account.email || account.id}`} onClick={() => openRemoveMember(account)}><UserMinus size={13} />{removing && removal?.id === account.id ? '正在移除' : '移除成员'}</button></div></td>
+            <td className="account-actions-cell"><div className="account-row-actions"><div className="account-actions-primary"><button className="button secondary compact-button" disabled={banned || acquiring || rowTarget?.ready || !teamWorkflows.some((item) => item.related) || Boolean(storedState?.loading)} title={rowTarget?.ready ? '目标 Team JSON 已获取成功；查看最新用量请刷新额度' : rowTarget ? `仅获取 ${account.email || account.id} 在 ${teamDisplayName(rowTarget.mother)} 的 Team JSON` : '选择此账号要获取授权的 Team'} onClick={() => rowTarget ? startAutoJson([account.id], rowTarget.mother.id, { retryAccount: true }) : openAccountActions(account)} aria-label={`自动获取 ${account.email || account.id} 的 JSON`}>{rowTarget?.ready ? <CheckCircle2 size={13} /> : <Bot size={13} />}{rowTarget?.ready ? '已获取' : rowTarget ? '自动获取' : '选择 Team 获取'}</button><button className="icon-button small" disabled={removing} title="更多操作" aria-label={`更多操作 ${account.email || account.id}`} onClick={() => openAccountActions(account)}><MoreHorizontal size={16} /></button></div><button className="button ghost compact-button account-remove-member" disabled={!canRemove || acquiring || Boolean(storedState?.loading)} title={canRemove ? '选择 Team 并确认移出成员，保留本地账号资料' : '暂无可移除的当前 Team 成员关系'} aria-label={`移除成员 ${account.email || account.id}`} onClick={() => openRemoveMember(account)}><UserMinus size={13} />{removing && removal?.id === account.id ? '正在移除' : '移除成员'}</button></div></td>
           </tr>;
         })}</tbody>
       </table></div>
@@ -2688,7 +2844,7 @@ function FreeAccountsView({ children, allChildren, mothers, loading = false, sea
         </select>
       </label>
       <div className="account-action-options">
-        <button disabled={isBanned(actionAccount) || acquiring || !actionMother} onClick={() => runAccountAction(() => startAutoJson([actionAccount.id], actionMother.id))}><Bot size={17} /><span>自动获取 JSON<small>{actionMother ? `目标：${teamDisplayName(actionMother)}` : '请先选择上方 Team'}</small></span></button>
+        <button disabled={isBanned(actionAccount) || acquiring || !actionMother || teamAutoJsonState(actionAccount, actionMother).ready} onClick={() => runAccountAction(() => startAutoJson([actionAccount.id], actionMother.id, { retryAccount: true }))}><Bot size={17} /><span>{teamAutoJsonState(actionAccount, actionMother).ready ? 'Team JSON 已获取' : '自动获取 JSON'}<small>{actionMother ? `仅此账号 · 目标：${teamDisplayName(actionMother)}` : '请先选择上方 Team'}</small></span></button>
         <button disabled={isBanned(actionAccount) || acquiring || Boolean(acquireStates?.[actionAccount.id]?.loading) || (actionWorkflows.length > 0 && !actionMother)} onClick={() => runAccountAction(() => openManual(actionAccount, null, actionMother))}><LogIn size={17} /><span>手动授权<small>{actionMother ? '处理所选 Team 的验证或回调' : '个人登录验证 / 回调'}</small></span></button>
         <button disabled={isBanned(actionAccount) || acquiring || Boolean(acquireStates?.[actionAccount.id]?.loading)} onClick={() => runAccountAction(() => acquireAccount(actionAccount.id, 'free-json'))}><CloudDownload size={17} /><span>获取并下载 Free JSON<small>个人授权 · 保留原方式</small></span></button>
         <button disabled={isBanned(actionAccount) || acquiring || Boolean(acquireStates?.[actionAccount.id]?.loading)} onClick={() => runAccountAction(() => acquireAccount(actionAccount.id, 'refresh-at'))}><RefreshCw size={17} /><span>刷新 AT<small>使用已有 RT 更新授权</small></span></button>
@@ -2826,13 +2982,17 @@ function IntegrationsView({ integrations, openIntegration, proxy, openProxy }) {
   const readySub2Apis = sub2apis.filter((item) => item.enabled && item.baseUrl && item.apiKeySet && ((Number.isFinite(Number(item.groupId)) && Number(item.groupId) > 0) || String(item.groupName || '').trim()));
   const mailboxReady = integrations.mailbox?.enabled && (integrations.mailbox.endpoint || integrations.mailbox.apiKeySet || integrations.mailbox.apiKey);
   const proxyReady = proxy?.enabled && proxy?.entries?.length;
+  const roxy = integrations.roxy || defaultRoxySettings;
+  const roxySummary = !roxy.enabled ? '未启用 · 纯协议登录' : roxy.profileMode === 'pooled'
+    ? `环境复用 · 最多 ${roxy.poolSize || 3} 个环境 · ${Math.min(roxy.concurrency || 1, roxy.poolSize || 3)} 有效并发`
+    : `Roxy 浏览器登录 · ${roxy.concurrency || 1} 并发 · ${roxy.profiles?.length || 0} 个账号已绑定`;
   return <section className="integrations-layout">
     <section className="content-panel integration-panel">
       <div className="content-toolbar"><div><h2>服务连接</h2></div></div>
       <div className="integration-item"><div className="integration-logo sub2api">S2</div><div><strong>Sub2API</strong><span>{readySub2Apis.length} / {sub2apis.length} 个连接可用</span></div><span className="connected">{readySub2Apis.length ? '已配置' : '未配置'}</span><button className="button ghost" onClick={() => openIntegration('sub2api')}><Settings2 size={14} />管理</button></div>
       <div className="integration-item"><div className="integration-logo mail"><Mail size={16} /></div><div><strong>邮箱 / 接码</strong><span>{integrations.mailbox?.serviceType === 'email-api' ? '邮箱 API' : integrations.mailbox?.serviceType === 'sms-api' ? '短信 API' : '手动接码'}</span></div><span className="connected">{mailboxReady ? '已配置' : '未配置'}</span><button className="button ghost" onClick={() => openIntegration('mailbox')}><Settings2 size={14} />配置</button></div>
       <div className="integration-item proxy-integration-item"><div className="integration-logo proxy"><SlidersHorizontal size={16} /></div><div><strong>代理池</strong><span>{proxy?.entries?.length ? `${proxy.entries.length} 条代理 · ${proxy.strategy === 'round_robin' ? '轮询' : '故障切换'}` : '尚无代理'}</span></div><span className="connected">{proxyReady ? '已启用' : proxy?.entries?.length ? '未启用' : '未配置'}</span><button className="button ghost" onClick={openProxy}><Settings2 size={14} />配置</button></div>
-      <div className="integration-item"><div className="integration-logo roxy"><Plug size={16} /></div><div><strong>RoxyBrowser</strong><span>{integrations.roxy?.enabled ? `Roxy 浏览器登录 · ${integrations.roxy?.concurrency || 1} 并发 · ${integrations.roxy?.profiles?.length || 0} 个账号已绑定` : '未启用 · 纯协议登录'}</span></div><span className="connected">{integrations.roxy?.enabled ? '已启用' : '未启用'}</span><button className="button ghost" onClick={() => openIntegration('roxy')}><Settings2 size={14} />配置</button></div>
+      <div className="integration-item"><div className="integration-logo roxy"><Plug size={16} /></div><div><strong>RoxyBrowser</strong><span>{roxySummary}</span></div><span className="connected">{integrations.roxy?.enabled ? '已启用' : '未启用'}</span><button className="button ghost" onClick={() => openIntegration('roxy')}><Settings2 size={14} />配置</button></div>
     </section>
   </section>;
 }
@@ -3035,7 +3195,7 @@ function ProxyModal({ proxy = defaultProxySettings, onClose, onSave, onAdd, onRe
 function AgentAccessModal({ onClose, notify }) {
   const httpEndpoint = `${API_BASE || window.location.origin}/mcp`;
   const httpConfig = JSON.stringify({ mcpServers: { 'team-rotation': { url: httpEndpoint } } }, null, 2);
-  const stdioConfig = JSON.stringify({ mcpServers: { 'team-rotation': { command: 'npm', args: ['run', 'mcp'], cwd: 'F:/ai-work/gpt-tila-team', env: { QUOTA_HUB_MCP_URL: 'http://127.0.0.1:8786/mcp' } } } }, null, 2);
+  const stdioConfig = JSON.stringify({ mcpServers: { 'team-rotation': { command: 'npm', args: ['run', 'mcp'], cwd: '/path/to/auto-team-custom', env: { QUOTA_HUB_MCP_URL: 'http://127.0.0.1:8786/mcp' } } } }, null, 2);
   async function copyConfig(value) {
     try {
       await navigator.clipboard.writeText(value);

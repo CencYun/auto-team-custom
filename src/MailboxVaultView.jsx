@@ -190,6 +190,7 @@ export default function MailboxVaultView({ apiRequest, notify }) {
     const ids = all ? records.map((record) => record.id) : [...selected];
     if (!ids.length || unavailable) return;
     setPending(all ? 'export-all' : 'export');
+    let downloadInitiated = false;
     try {
       const payload = await apiRequest(`${endpoint}/export`, { method: 'POST', body: JSON.stringify({ ids }) });
       if (!mounted.current) return;
@@ -200,10 +201,29 @@ export default function MailboxVaultView({ apiRequest, notify }) {
       link.href = url;
       link.download = `mailbox-vault-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
       document.body.append(link); link.click(); link.remove();
+      downloadInitiated = true;
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-      notify(`已导出 ${payload.records.length} 个邮箱（TXT）`);
+      const exportedRecords = payload.records.map(({ id, account }) => ({ id, account }));
+      const result = await apiRequest(`${endpoint}/mark-exported`, { method: 'POST', body: JSON.stringify({ records: exportedRecords }) });
+      const exportedAccounts = new Map(exportedRecords.map(({ id, account }) => [id, account.trim().toLowerCase()]));
+      if (!Array.isArray(result.records) || result.records.length !== ids.length
+        || new Set(result.records.map((record) => record.id)).size !== ids.length
+        || result.records.some((record) => exportedAccounts.get(record.id) !== record.account?.trim().toLowerCase() || !record.exportedAt)) {
+        throw new Error('邮箱标记返回格式不正确，请刷新后检查');
+      }
+      if (!mounted.current) return;
+      const exportedMetadata = new Map(result.records.map((record) => [record.id, record]));
+      setRecords((current) => current.map((record) => {
+        const metadata = exportedMetadata.get(record.id);
+        return metadata && metadata.account.trim().toLowerCase() === record.account.trim().toLowerCase()
+          ? { ...record, exportedAt: metadata.exportedAt } : record;
+      }));
+      notify(`已导出 ${payload.records.length} 个邮箱（TXT），并标注“已使用”`);
     } catch (failure) {
-      if (mounted.current) { notify(`导出失败：${failure.message}`, 'error'); setReload((current) => current + 1); }
+      if (mounted.current) {
+        notify(downloadInitiated ? `文件已导出，但“已使用”标记保存失败：${failure.message}` : `导出失败：${failure.message}`, 'error');
+        setReload((current) => current + 1);
+      }
     } finally { if (mounted.current) setPending(''); }
   }
 
@@ -245,9 +265,9 @@ export default function MailboxVaultView({ apiRequest, notify }) {
       : loading ? <div className="empty-state" role="status"><RefreshCw size={25} className="button-spinner" /><strong>正在加载邮箱</strong></div>
         : !visibleRecords.length ? <div className="empty-state"><Mail size={28} /><strong>{records.length ? '没有匹配的邮箱' : '暂未存放邮箱'}</strong><span>{records.length ? '请调整搜索条件。' : '点击“一键导入邮箱”，批量粘贴或选择文件，自动拆分为独立邮箱。'}</span></div>
           : <div className="table-wrap mother-vault-table-wrap"><table className="data-table mother-vault-table mailbox-vault-table"><thead><tr><th className="mother-vault-check"><span className="mother-vault-sr-only">选择</span></th><th>邮箱账号</th><th>密码</th><th>2FA 密钥</th><th>操作</th></tr></thead><tbody>{visibleRecords.map((record) => <tr key={record.id} className={selectedSet.has(record.id) ? 'mother-vault-selected' : ''}>
-            <td className="mother-vault-check"><input type="checkbox" aria-label={`选择邮箱 ${record.account}`} checked={selectedSet.has(record.id)} disabled={unavailable} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, record.id])] : current.filter((id) => id !== record.id))} /></td><td><strong className="mother-vault-account">{record.account}</strong></td><td>{renderSecret(record, 'password', '密码')}</td><td>{renderSecret(record, 'totp', '2FA 密钥')}</td><td><div className="mother-vault-row-actions"><button type="button" className="mother-vault-icon" aria-label={`编辑邮箱 ${record.account}`} title="编辑邮箱" disabled={unavailable} onClick={() => editRecord(record)}><Pencil size={15} /></button><button type="button" className="mother-vault-icon mother-vault-danger" aria-label={`删除邮箱 ${record.account}`} title="删除本地邮箱" disabled={unavailable} onClick={() => openDialog('delete', { ids: [record.id] })}><Trash2 size={15} /></button></div></td>
+            <td className="mother-vault-check"><input type="checkbox" aria-label={`选择邮箱 ${record.account}`} checked={selectedSet.has(record.id)} disabled={unavailable} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, record.id])] : current.filter((id) => id !== record.id))} /></td><td><strong className="mother-vault-account">{record.account}</strong>{record.exportedAt && <small className="mailbox-vault-used" title="已导出，可再次导出">已使用</small>}</td><td>{renderSecret(record, 'password', '密码')}</td><td>{renderSecret(record, 'totp', '2FA 密钥')}</td><td><div className="mother-vault-row-actions"><button type="button" className="mother-vault-icon" aria-label={`编辑邮箱 ${record.account}`} title="编辑邮箱" disabled={unavailable} onClick={() => editRecord(record)}><Pencil size={15} /></button><button type="button" className="mother-vault-icon mother-vault-danger" aria-label={`删除邮箱 ${record.account}`} title="删除本地邮箱" disabled={unavailable} onClick={() => openDialog('delete', { ids: [record.id] })}><Trash2 size={15} /></button></div></td>
           </tr>)}</tbody></table></div>}
-    <p className="mother-vault-footnote">TXT 每行：邮箱----密码----2FA。支持勾选导出或全部导出，可重新导入。</p>
+    <p className="mother-vault-footnote">TXT 每行：邮箱----密码----2FA。导出的邮箱会标注“已使用”，仍可再次导出或重新导入。</p>
     {dialog && <MailboxDialog title={dialog.type === 'import' ? '批量导入邮箱' : dialog.type === 'delete' ? '删除本地邮箱' : dialog.type === 'edit' ? '编辑邮箱' : '添加邮箱'} busy={busy} onClose={closeDialog}>
       {(dialog.type === 'create' || dialog.type === 'edit') && <form className="mother-vault-form" autoComplete="off" onSubmit={saveRecord}>
         <label className="mother-vault-field">邮箱账号<input type="email" required value={form.account} autoComplete="off" placeholder="account@example.com" disabled={busy} onChange={(event) => setForm((current) => ({ ...current, account: event.target.value }))} /></label>

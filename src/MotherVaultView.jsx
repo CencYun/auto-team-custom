@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Download, Eye, EyeOff, FolderLock, Pencil, Plus, RefreshCw, Search, Trash2, Upload, X } from 'lucide-react';
 import { exportMotherVaultText } from '../shared/mother-vault-text.mjs';
+import { sortMotherVaultByRemarkDate } from '../shared/mother-vault-order.mjs';
 import './mother-vault.css';
 
 const emptyRecord = () => ({ account: '', password: '', totp: '', note: '', remarkTime: '' });
@@ -64,6 +65,7 @@ export default function MotherVaultView({ apiRequest, notify }) {
   const [selected, setSelected] = useState([]);
   const [exportFormat, setExportFormat] = useState('txt');
   const [search, setSearch] = useState('');
+  const [dateSortDirection, setDateSortDirection] = useState('ascending');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [reload, setReload] = useState(0);
@@ -114,8 +116,8 @@ export default function MotherVaultView({ apiRequest, notify }) {
 
   const visibleRecords = useMemo(() => {
     const query = search.trim().toLowerCase();
-    return records.filter((record) => !query || [record.account, record.note, record.remarkTime].some((value) => String(value || '').toLowerCase().includes(query)));
-  }, [records, search]);
+    return sortMotherVaultByRemarkDate(records.filter((record) => !query || [record.account, record.note, record.remarkTime].some((value) => String(value || '').toLowerCase().includes(query))), dateSortDirection);
+  }, [records, search, dateSortDirection]);
   const selectedSet = new Set(selected);
   const selectedVisible = visibleRecords.filter((record) => selectedSet.has(record.id)).length;
   const allVisibleSelected = visibleRecords.length > 0 && selectedVisible === visibleRecords.length;
@@ -338,7 +340,7 @@ export default function MotherVaultView({ apiRequest, notify }) {
     {loadError ? <div className="empty-state mother-vault-error" role="alert"><AlertTriangle size={25} /><strong>{loadError}</strong><button type="button" className="button ghost" onClick={() => setReload((current) => current + 1)}>重试</button></div>
       : loading ? <div className="empty-state" role="status"><RefreshCw size={25} className="button-spinner" /><strong>正在加载母号资料</strong></div>
         : !visibleRecords.length ? <div className="empty-state"><FolderLock size={28} /><strong>{records.length ? '没有匹配的母号资料' : '暂未存放母号资料'}</strong><span>{records.length ? '请调整搜索条件。' : '点击“添加母号”逐条保存，或导入文本、JSON 文件。'}</span></div>
-          : <div className="table-wrap mother-vault-table-wrap"><table className="data-table mother-vault-table"><thead><tr><th className="mother-vault-check"><span className="mother-vault-sr-only">选择</span></th><th>账号</th><th>密码</th><th>2FA 密钥</th><th>备注</th><th>备注时间</th><th>操作</th></tr></thead><tbody>{visibleRecords.map((record) => <tr key={record.id} className={selectedSet.has(record.id) ? 'mother-vault-selected' : ''}>
+          : <div className="table-wrap mother-vault-table-wrap"><table className="data-table mother-vault-table"><thead><tr><th className="mother-vault-check"><span className="mother-vault-sr-only">选择</span></th><th>账号</th><th>密码</th><th>2FA 密钥</th><th>备注</th><th aria-sort={dateSortDirection}><button type="button" className="mother-vault-date-sort" onClick={() => setDateSortDirection((current) => current === 'ascending' ? 'descending' : 'ascending')} aria-label={`备注时间：当前${dateSortDirection === 'ascending' ? '从早到晚' : '从晚到早'}，点击切换为${dateSortDirection === 'ascending' ? '从晚到早' : '从早到晚'}`} title={`点击按日期${dateSortDirection === 'ascending' ? '从晚到早' : '从早到晚'}排序；未填写或无法识别的日期放在最后`}>备注时间 <span aria-hidden="true">{dateSortDirection === 'ascending' ? '↑' : '↓'}</span></button></th><th>操作</th></tr></thead><tbody>{visibleRecords.map((record) => <tr key={record.id} className={selectedSet.has(record.id) ? 'mother-vault-selected' : ''}>
             <td className="mother-vault-check"><input type="checkbox" aria-label={`选择母号 ${record.account}`} checked={selectedSet.has(record.id)} disabled={busy} onChange={(event) => setSelected((current) => event.target.checked ? [...new Set([...current, record.id])] : current.filter((id) => id !== record.id))} /></td>
             <td><strong className="mother-vault-account">{record.account}</strong></td>
             <td>{renderSecret(record, 'password', '密码')}</td><td>{renderSecret(record, 'totp', '2FA 密钥')}</td>

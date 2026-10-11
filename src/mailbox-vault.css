@@ -3,3 +3,5 @@
 .mailbox-vault-table th:nth-child(3), .mailbox-vault-table th:nth-child(4) { width: 26%; }
 .mailbox-vault-table th:last-child { width: 76px; }
 .mailbox-vault-table th, .mailbox-vault-table td { padding-top: 11px; padding-bottom: 11px; }
+.mailbox-vault-table .mailbox-vault-used { display: block; margin-top: 3px; font-size: 10px; line-height: 1.4; color: #bf4545; }
+html[data-theme='dark'] .mailbox-vault-table .mailbox-vault-used { color: #ee9999; }
