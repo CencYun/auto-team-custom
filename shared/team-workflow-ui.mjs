@@ -103,6 +103,28 @@ export function teamAccountWorkflows(account, mothers = [], motherId = '') {
     .filter((workflow) => targetId || workflow.related || workflow.authorization || workflow.membership);
 }
 
+// A batch counts only pending accounts for its exact Team. Explicit ids keep a
+// row action scoped to that row; an empty selection must never mean "all".
+export function teamAutoJsonCandidates(accounts = [], mother, ids = null) {
+  const selected = Array.isArray(ids) ? new Set(ids) : null;
+  const seen = new Set();
+  return (Array.isArray(accounts) ? accounts : []).filter((account) => {
+    if (!account?.id || seen.has(account.id) || selected && !selected.has(account.id)
+      || account.status === 'banned' || account.banStatus === 'banned') return false;
+    seen.add(account.id);
+    const workflow = teamAutoJsonState(account, mother);
+    return workflow.related && !workflow.ready;
+  });
+}
+
+// Overview rows may choose their only associated Team. Multiple Teams require
+// an explicit user choice, and a selected unrelated Team is never substituted.
+export function teamAutoJsonRowTarget(account, mothers = [], motherId = '') {
+  const related = teamAccountWorkflows(account, mothers).filter((workflow) => workflow.related);
+  return motherId ? related.find((workflow) => key(workflow.mother.id) === key(motherId)) || null
+    : related.length === 1 ? related[0] : null;
+}
+
 export function teamMemberRemovalState(account, mother) {
   const workflow = teamAutoJsonState(account, mother);
   const primaryEmail = key(mother?.primaryOwnerEmail || mother?.email);
