@@ -71,6 +71,7 @@ async function fixture(t, { children = [child()], mothers = [mother(), mother('t
       const body = new URLSearchParams(Buffer.concat(chunks).toString());
       entry.grantType = body.get('grant_type');
       entry.refreshToken = body.get('refresh_token');
+      entry.authorizationCode = body.get('code');
       reply = await onRefresh?.(entry, requests) || { status: 401, payload: { error: 'private-refresh-error' } };
     }
     res.writeHead(reply.status || 200, { 'content-type': 'application/json' });
@@ -276,6 +277,45 @@ test('401 without Team RT remains a scoped error and never launches password/bro
   assert.equal(app.requests.length, 1);
 });
 
+test('confirmed rejected authorization invalidates only its Team while retaining credentials and historical quota', async (t) => {
+  const member = child();
+  const app = await fixture(t, { children: [member], onUsage: () => ({ status: 401, payload: { error: 'invalid_token' } }),
+    onRefresh: () => ({ status: 400, payload: { error: 'invalid_grant', error_description: 'Please authenticate again.' } }) });
+  const result = await app.request();
+  assert.equal(result.data.code, 'team_token_refresh_failed');
+  const saved = (await app.saved()).children[0];
+  assert.equal(saved.workspaceHistory[0].workspaceTokenStatus, 'invalid');
+  assert.equal(saved.workspaceHistory[0].workspaceTokenInvalid, true);
+  assert.deepEqual(saved.workspaceTokens, member.workspaceTokens);
+  assert.deepEqual(saved.workspaceHistory[0].quotaSnapshot, member.workspaceHistory[0].quotaSnapshot);
+  assert.deepEqual(saved.workspaceHistory[1], member.workspaceHistory[1]);
+  const state = (await app.request('/api/state', { method: 'GET' })).data;
+  const authorizations = state.children[0].teamAuthorizations;
+  assert.equal(authorizations.find((entry) => entry.workspaceId === 'team-a').ready, false);
+  assert.equal(authorizations.find((entry) => entry.workspaceId === 'team-a').needsReauthorization, true);
+  assert.equal(authorizations.find((entry) => entry.workspaceId === 'team-b').ready, true);
+  assert.deepEqual(app.requests.map((entry) => entry.pathname), ['/backend-api/wham/usage', '/mock-token']);
+});
+
+test('expired-token RT invalid_grant is confirmed but generic 403 refresh blocking only enables a retry', async (t) => {
+  for (const status of [400, 403]) await t.test(String(status), async (t) => {
+    const member = child();
+    member.workspaceTokens['team-a'] = credentials('team-a', { expiresIn: -100 });
+    const app = await fixture(t, { children: [member], onRefresh: () => ({ status,
+      payload: status === 400 ? { error: 'invalid_grant', error_description: 'Please authenticate again.' } : { error: 'challenge_required' } }) });
+    const result = await app.request();
+    const publicChild = (await app.request('/api/state', { method: 'GET' })).data.children[0];
+    const authorization = publicChild.teamAuthorizations.find((entry) => entry.workspaceId === 'team-a');
+    assert.equal(authorization.needsReauthorization, status === 400);
+    assert.equal(authorization.retryAuthorization, true);
+    if (status === 403) assert.doesNotMatch(result.data.message, /已失效/);
+    const saved = (await app.saved()).children[0];
+    assert.deepEqual(saved.workspaceTokens, member.workspaceTokens);
+    assert.deepEqual(saved.workspaceHistory[0].quotaSnapshot, member.workspaceHistory[0].quotaSnapshot);
+    assert.deepEqual(app.requests.map((entry) => entry.pathname), ['/mock-token']);
+  });
+});
+
 test('duplicate concurrent refresh clicks share one in-flight request', async (t) => {
   const entered = deferred();
   const release = deferred();
@@ -290,6 +330,49 @@ test('duplicate concurrent refresh clicks share one in-flight request', async (t
   assert.deepEqual(replies[0], replies[1]);
   assert.equal(replies[0].status, 200);
   assert.equal(app.requests.length, 1);
+});
+
+test('a manual callback waits for an older maintenance probe and its saved token stays valid', async (t) => {
+  const entered = deferred();
+  const release = deferred();
+  const member = child();
+  member.workspaceTokens['team-a'].refreshToken = '';
+  const updatedToken = token('team-a', { expiresIn: 7200 });
+  const app = await fixture(t, { children: [member], onUsage: async (entry) => {
+    if (entry.userId !== 'member-user') return { payload: usage() };
+    entered.resolve();
+    await release.promise;
+    return { status: 401, payload: { error: 'invalid_token' } };
+  }, onRefresh: (entry) => {
+    assert.equal(entry.grantType, 'authorization_code');
+    return { payload: { access_token: updatedToken, refresh_token: 'private-new-callback-rt' } };
+  }, onOther: (entry) => {
+    if (entry.pathname === '/backend-api/accounts/team-a/users') return { payload: { items: [
+      { id: 'owner-user', email: 'owner@example.test', role: 'account-owner' },
+      { id: 'member-user', email, role: 'standard-user' },
+    ], total: 2 } };
+    if (entry.pathname === '/backend-api/subscriptions') return { payload: { seats_entitled: 2, seats_in_use: 2 } };
+    if (entry.pathname === '/backend-api/codex/responses') return { payload: { status: 'completed' } };
+    return null;
+  } });
+  const link = await app.request('/api/children/member/team-auth', { body: { ...scope, manual: true } });
+  const state = new URL(link.data.authUrl).searchParams.get('state');
+  const checking = app.request('/api/maintenance/check', { body: { motherId: scope.motherId, childIds: ['member'] } });
+  await entered.promise;
+  const callback = app.request('/api/children/member/team-auth', { body: { ...scope,
+    callbackUrl: `http://localhost:1455/auth/callback?code=manual-code&state=${state}` } });
+  await delay(60);
+  assert.equal(app.requests.some((entry) => entry.grantType === 'authorization_code'), false);
+  release.resolve();
+  const results = await Promise.all([checking, callback]);
+  assert.equal(results[1].data.ok, true);
+  const saved = (await app.saved()).children[0];
+  assert.equal(saved.workspaceTokens['team-a'].accessToken, updatedToken);
+  assert.equal(saved.workspaceHistory[0].workspaceTokenInvalid, false);
+  assert.equal(saved.workspaceHistory[0].lastProbe.status, 401);
+  const authorization = results[1].data.child.teamAuthorizations.find((entry) => entry.workspaceId === 'team-a');
+  assert.equal(authorization.ready, true);
+  assert.equal(authorization.needsReauthorization, false);
 });
 
 test('different Team refreshes for one child serialize without copying values into another Team', async (t) => {

@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { OPENAI_OAUTH_CLIENT_ID, accessTokenClaims, isOpenAiAuthFailure, refreshOpenAiAccessToken } from './openai-auth.mjs';
-import { clearOAuthCallback, consumeOAuthCallback, loginFreeAccount, parseValidOAuthCallback, storeOAuthCallback } from './openai-login.mjs';
+import { clearOAuthCallback, consumeOAuthCallback, loginFreeAccount, parseValidOAuthCallback, prepareOAuthAuthorization, storeOAuthCallback } from './openai-login.mjs';
 import { createProxyFetch, maskProxyUrl, parseProxyInput, publicProxySettings } from './proxy.mjs';
 import { normalizeLocalProxyUrl } from './proxy-chain.mjs';
 import { createStateStorage, isLoopbackHost, secureTokenEqual } from './security.mjs';
@@ -618,6 +618,7 @@ function resetTeamLoginState(child, workspaceId, message = 'Team 授权已就绪
 
 function adoptAccountTeamToken(mother, child, candidate = workspaceTokenFor(child, mother?.accountId)) {
   if (!mother || !child || candidate?.source !== 'account_team_token') return null;
+  if (teamAuthorizationHealth(child, mother.accountId).needsReauthorization) return null;
   if (!isChildMemberOfTeam(child, mother.team)) return null;
   const workspaceId = String(mother.accountId || '').trim();
   const validated = accountTeamTokenFor({ ...child, accessToken: candidate.accessToken }, workspaceId);
@@ -859,7 +860,48 @@ function saveWorkspaceToken(child, workspaceId, accessToken, claims = {}, oauth 
     source: oauth.source || 'workspace_session_exchange',
   };
   child.workspaceTokens[workspaceId] = record;
+  clearTeamTokenInvalidation(child, workspaceId);
   return record;
+}
+
+function confirmedTeamAuthFailure(result = {}) {
+  if (result.ok === true) return false;
+  return result.authorizationInvalid === true || isOpenAiAuthFailure(result)
+    || /(?:invalid_grant|refresh_token_(?:reused|expired|invalid)|token_revoked)/i.test([result.code, result.errorCode, result.message].filter(Boolean).join(' '));
+}
+
+function teamAuthorizationHealth(child, workspaceId) {
+  const membership = (Array.isArray(child?.workspaceHistory) ? child.workspaceHistory : [])
+    .find((entry) => entry.status === 'active' && workspaceIdKey(entry.team || entry.workspaceId) === workspaceIdKey(workspaceId));
+  const probe = membership?.lastProbe;
+  const needsReauthorization = membership?.workspaceTokenInvalid === true
+    || (membership?.workspaceTokenInvalid !== false && (membership?.workspaceTokenStatus === 'invalid'
+      || confirmedTeamAuthFailure(probe || {})));
+  // Old snapshots have no invalidation flag. Keep their failed refresh visible
+  // and retryable even when a 403 cannot prove that the credentials were revoked.
+  const retryAuthorization = needsReauthorization || membership?.authorizationRetryRequired === true || Boolean(probe?.ok === false
+    && probe.errorCode === 'team_token_refresh_failed' && membership?.workspaceTokenInvalid !== false);
+  return { needsReauthorization, retryAuthorization };
+}
+
+function clearTeamTokenInvalidation(child, workspaceId) {
+  const membership = membershipFor(child, workspaceId);
+  if (!membership) return;
+  membership.workspaceTokenInvalid = false;
+  membership.authorizationRetryRequired = false;
+  membership.tokenInvalidAt = null;
+  membership.tokenInvalidCode = null;
+}
+
+function invalidateTeamToken(child, workspaceId, result) {
+  const membership = membershipFor(child, workspaceId);
+  if (!membership) return;
+  membership.workspaceTokenStatus = 'invalid';
+  membership.workspaceTokenInvalid = true;
+  membership.tokenInvalidAt = now();
+  membership.tokenInvalidCode = result.errorCode || result.code || 'team_quota_auth_failed';
+  setTeamLoginState(child, workspaceId, { status: 'login_required', code: 'team_authorization_invalid',
+    message: '此空间的 Team 授权已失效，请重新获取 Team JSON' });
 }
 function membershipHistoryFor(child, teamId) {
   if (!child || !teamId || !Array.isArray(child.workspaceHistory)) return [];
@@ -1024,6 +1066,7 @@ function saveTeamInvitation(child, mother, fields = {}) {
 
 function completeTeamJsonFor(child, mother, { allowExpired = false } = {}) {
   const workspaceId = configuredTeamId(mother);
+  if (teamAuthorizationHealth(child, workspaceId).needsReauthorization) return null;
   const record = child?.workspaceTokens?.[workspaceId];
   const claims = accessTokenClaims(record?.accessToken);
   const plan = String(claims.planType || record?.planType || '').toLowerCase();
@@ -1087,7 +1130,7 @@ function publicChild(child, teamId = null) {
       const workspaceId = configuredTeamId(mother);
       const record = child.workspaceTokens?.[workspaceId];
       if (!invitationForTeam(child, mother) && !isChildMemberOfTeam(child, mother.team) && !record && !child.teamAuthSessions?.[workspaceId]) return [];
-      return [{ motherId: mother.id, workspaceId, hasAccessToken: Boolean(record?.accessToken), hasRefreshToken: Boolean(record?.refreshToken), expiresAt: accessTokenClaims(record?.accessToken).expiresAt || null, ready: Boolean(completeTeamJsonFor(child, mother)), login: teamLoginFor(child, workspaceId) }];
+      return [{ motherId: mother.id, workspaceId, hasAccessToken: Boolean(record?.accessToken), hasRefreshToken: Boolean(record?.refreshToken), expiresAt: accessTokenClaims(record?.accessToken).expiresAt || null, ready: Boolean(completeTeamJsonFor(child, mother)), ...teamAuthorizationHealth(child, workspaceId), login: teamLoginFor(child, workspaceId) }];
     }),
     quota5h: quotaRecord.quota5h ?? null,
     quota7d: quotaRecord.quota7d ?? null,
@@ -3503,6 +3546,12 @@ function applyQuotaResult(child, result, teamId = null, window = selectedKickWin
   }
   if (membership) {
     membership.lastProbe = result;
+    if (result.ok === false && result.errorCode === 'team_token_refresh_failed') membership.authorizationRetryRequired = true;
+    if (confirmedTeamAuthFailure(result)) invalidateTeamToken(child, teamId, result);
+    else if (success) {
+      clearTeamTokenInvalidation(child, teamId);
+      if (membership.workspaceTokenStatus === 'invalid') membership.workspaceTokenStatus = 'ready';
+    }
     if (success && (hasMeasuredQuota || durationMapped)) {
       membership.quota5h = nextQuota5h;
       membership.quota7d = nextQuota7d;
@@ -3581,12 +3630,12 @@ async function refreshChildTeamQuota(childId, body = {}) {
   };
   const snapshot = () => ({ quota5h: membership.quota5h ?? null, quota7d: membership.quota7d ?? null,
     quotaUpdatedAt: membership.quotaUpdatedAt || null });
-  const recordFailure = async (code, message, upstreamStatus = 0, status = 502) => {
+  const recordFailure = async (code, message, upstreamStatus = 0, status = 502, authorizationInvalid = false) => {
     const stale = currentFailure();
     if (stale) return stale;
     // Error text is intentionally local: an upstream body may contain tokens
     // or proxy credentials. Preserve the last successful observation intact.
-    applyQuotaResult(child, { ok: false, status: upstreamStatus, errorCode: code, message,
+    applyQuotaResult(child, { ok: false, status: upstreamStatus, errorCode: code, message, authorizationInvalid,
       primary: readWindow(), secondary: readWindow(), quotaWindowMapping: 'duration-v1', source: 'wham/usage' }, workspaceId, selectedKickWindow(mother));
     const result = failure(status, code, message, { ...snapshot(), upstreamStatus });
     await persist();
@@ -3620,6 +3669,7 @@ async function refreshChildTeamQuota(childId, body = {}) {
           return recordFailure('team_token_required', '此账号尚无匹配的 Team 授权，请先获取 Team JSON', 0, 409);
         }
         let refreshedOnce = false;
+        let accessTokenRejected = false;
         const refreshToken = async () => {
           if (!token.refreshToken) return { ok: false, status: 401 };
           const beforeAccessToken = token.accessToken;
@@ -3632,7 +3682,7 @@ async function refreshChildTeamQuota(childId, body = {}) {
             return { stale: failure(409, 'team_token_changed', 'Team 授权已更新，请重新刷新额度') };
           }
           if (!refreshed.ok || !matchesToken(refreshed.accessToken) || !teamTokenDetails(refreshed.accessToken, workspaceId)) {
-            return { ok: false, status: refreshed.status || 0 };
+            return { ok: false, status: refreshed.status || 0, authorizationInvalid: confirmedTeamAuthFailure(refreshed) };
           }
           token = saveWorkspaceToken(child, workspaceId, refreshed.accessToken, refreshed.claims, {
             refreshToken: refreshed.refreshToken || beforeRefreshToken, idToken: refreshed.idToken || token.idToken || '',
@@ -3640,12 +3690,17 @@ async function refreshChildTeamQuota(childId, body = {}) {
           });
           membership.workspaceTokenStatus = 'ready';
           membership.workspaceTokenUpdatedAt = token.acquiredAt;
+          resetTeamLoginState(child, workspaceId, '已有 Team JSON 的令牌已刷新');
           await persist();
           refreshedOnce = true;
           return currentFailure() ? { stale: currentFailure() } : { ok: true };
         };
         const refreshFailure = (result) => result.stale || recordFailure('team_token_refresh_failed',
-          'Team 授权已失效，刷新失败；请重新获取此空间的 Team JSON', result.status || 0);
+          result.authorizationInvalid || accessTokenRejected
+            ? 'Team 授权已失效，刷新失败；请重新获取此空间的 Team JSON'
+            : Number(result.status) === 403 ? 'Team 授权刷新请求被拒绝（403），请检查代理网络后重试，或重新授权'
+              : 'Team 授权刷新失败，请稍后重试，或重新获取此空间的 Team JSON',
+          result.status || 0, 502, Boolean(result.authorizationInvalid || accessTokenRejected));
         if (!teamTokenDetails(token.accessToken, workspaceId)) {
           const refreshed = await refreshToken();
           if (!refreshed.ok) return refreshFailure(refreshed);
@@ -3654,6 +3709,7 @@ async function refreshChildTeamQuota(childId, body = {}) {
         stale = currentFailure();
         if (stale) return stale;
         if (!refreshedOnce && isOpenAiAuthFailure(probe) && token.refreshToken) {
+          accessTokenRejected = true;
           const refreshed = await refreshToken();
           if (!refreshed.ok) return refreshFailure(refreshed);
           probe = await probeUsage(token.accessToken, workspaceId);
@@ -3662,11 +3718,12 @@ async function refreshChildTeamQuota(childId, body = {}) {
         }
         if (!probe.ok) {
           const status = Number(probe.status) || 0;
-          const code = status === 401 ? 'team_quota_auth_failed' : status === 403 ? 'team_quota_forbidden' : 'team_quota_request_failed';
-          const message = status === 401 ? 'Team 授权已失效，请重新获取此空间的 Team JSON'
+          const authorizationInvalid = confirmedTeamAuthFailure(probe);
+          const code = authorizationInvalid ? 'team_quota_auth_failed' : status === 403 ? 'team_quota_forbidden' : 'team_quota_request_failed';
+          const message = authorizationInvalid ? 'Team 授权已失效，请重新获取此空间的 Team JSON'
             : status === 403 ? '额度接口拒绝访问（403），请检查该空间授权与代理网络'
               : status ? `额度接口返回 ${status}，请稍后重试` : '额度请求超时或网络不可用，请检查代理后重试';
-          return recordFailure(code, message, status);
+          return recordFailure(code, message, status, 502, authorizationInvalid);
         }
         if (probe.primary?.usedPercent == null && probe.secondary?.usedPercent == null) {
           return recordFailure('team_quota_unavailable', '额度接口未返回 5h 或 7d 的真实数据，请稍后重试', probe.status);
@@ -3865,6 +3922,16 @@ async function rejectChildTokenIdentity(child) {
 }
 
 const childAuthQueues = new Map();
+
+async function withChildAuthQueue(child, operation) {
+  const key = String(child.id);
+  const previous = childAuthQueues.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+  childAuthQueues.set(key, current);
+  try { return await current; } finally {
+    if (childAuthQueues.get(key) === current) childAuthQueues.delete(key);
+  }
+}
 const childTeamAuthOperations = new Map();
 let roxyProfileProvisioning = Promise.resolve();
 const autoJsonExecution = new AsyncLocalStorage();
@@ -4495,7 +4562,9 @@ async function acquireTeamAuth(mother, child, options = {}) {
   childTeamAuthOperations.set(id, (childTeamAuthOperations.get(id) || 0) + 1);
   const key = String(child.id || child.email || 'unknown');
   const previous = childAuthQueues.get(key) || Promise.resolve();
-  const current = previous.catch(() => {}).then(() => withChildAuthorizationNetwork(child, options.browserLogin, () => acquireTeamAuthInternal(mother, child, options)));
+  const current = previous.catch(() => {}).then(() => options.manual === true
+    ? acquireTeamAuthInternal(mother, child, options)
+    : withChildAuthorizationNetwork(child, options.browserLogin, () => acquireTeamAuthInternal(mother, child, options)));
   childAuthQueues.set(key, current);
   try {
     return await current;
@@ -4507,7 +4576,7 @@ async function acquireTeamAuth(mother, child, options = {}) {
   }
 }
 
-async function acquireTeamAuthInternal(mother, child, { verificationCode = '', callbackUrl = '', force = false, syncSub2Api = true, persistOwner = true, browserLogin = true, expectedMembership = null, onProgress = () => {} } = {}) {
+async function acquireTeamAuthInternal(mother, child, { verificationCode = '', callbackUrl = '', force = false, manual = false, syncSub2Api = true, persistOwner = true, browserLogin = true, expectedMembership = null, onProgress = () => {} } = {}) {
   const workspaceId = String(mother?.accountId || '').trim();
   if (!mother || !child || !workspaceId) return { ok: false, status: 400, code: 'workspace_id_required', message: '请先配置目标 Team ID' };
   const originalEmail = child.email;
@@ -4518,12 +4587,30 @@ async function acquireTeamAuthInternal(mother, child, { verificationCode = '', c
   }
   if (childIsBanned(child)) return { ok: false, status: 409, code: 'account_banned', message: child.banReason || '账号已封禁，不能生成 Team JSON', banned: true, child: publicChild(child, mother.team) };
   const originalSession = child.teamAuthSessions?.[workspaceId] || null;
+  if (manual) {
+    const adapter = sub2ApiOAuthAdapter(sub2ApiConfigForMother(mother), child, { scope: 'team', workspaceId });
+    const reusable = teamSessionAuthorizationUrl(originalSession)
+      && (originalSession.codeVerifier && !originalSession.authorization
+        || originalSession.authorization && adapter && oauthSessionForAdapter(originalSession, adapter) === originalSession);
+    // New manual links use local PKCE. Preparing one needs no credentials,
+    // proxy, Sub2API request, or Roxy browser; existing provider links can resume.
+    const prepared = await prepareOAuthAuthorization({ session: reusable ? originalSession : null });
+    if (originalSession?.state && !reusable) clearOAuthCallback(originalSession.state, originalSession.callbackUrl || '');
+    if (!child.teamAuthSessions || typeof child.teamAuthSessions !== 'object' || Array.isArray(child.teamAuthSessions)) child.teamAuthSessions = {};
+    child.teamAuthSessions[workspaceId] = prepared.session;
+    const message = '已生成此账号的 Team 授权链接，请在浏览器完成授权后提交回调地址';
+    setTeamLoginState(child, workspaceId, { status: 'browser_verification_required', code: 'manual_authorization_ready',
+      message, browserRequired: true, needsInput: true, authUrl: prepared.authUrl, attemptedAt: now() });
+    await persist();
+    return { ok: true, status: 200, code: 'manual_authorization_ready', motherId: mother.id, workspaceId,
+      authUrl: prepared.authUrl, browserRequired: true, needsInput: true, message, child: publicChild(child, mother.team) };
+  }
   const callbackFailure = explicitOAuthCallbackFailure(originalSession, callbackUrl);
   if (callbackFailure) return { ...callbackFailure, child: publicChild(child, mother.team) };
   const completedCallback = pendingOAuthCallback(originalSession, callbackUrl);
   const changedLoginBackend = !completedCallback && retryWithChangedLoginBackend(child, workspaceId);
   const existing = workspaceTokenFor(child, workspaceId);
-  if (!completedCallback && existing?.accessToken && !force) {
+  if (!completedCallback && existing?.accessToken && !force && !teamAuthorizationHealth(child, workspaceId).retryAuthorization) {
     resetTeamLoginState(child, workspaceId);
     return { ok: true, status: 200, code: 'ready', source: 'stored_team_token', format: 'team-json', tokenScope: 'team', child: publicChild(child, mother.team) };
   }
@@ -4750,7 +4837,8 @@ function acquireTeamJson(mother, child, { verificationCode = '', callbackUrl = '
     return acquireTeamAuth(mother, child, { force: true, verificationCode, callbackUrl, browserLogin, onProgress });
   }
   const existing = workspaceTokenFor(child, mother?.accountId);
-  if (existing?.refreshToken && teamTokenDetails(existing.accessToken, mother?.accountId)) {
+  if (existing?.refreshToken && teamTokenDetails(existing.accessToken, mother?.accountId)
+    && !teamAuthorizationHealth(child, mother.accountId).retryAuthorization) {
     adoptAccountTeamToken(mother, child, existing);
     resetTeamLoginState(child, mother.accountId);
     return Promise.resolve({ ok: true, status: 200, source: 'stored_team_token', format: 'team-json', tokenScope: 'team' });
@@ -4875,7 +4963,7 @@ async function checkTeam(motherId, { childIds = [] } = {}) {
   mother.bannedAt = ownerBanReason ? (mother.bannedAt || now()) : null;
   mother.managementStatus = managementHealth(workspace.membersResult, workspace.subscriptionResult);
   const kickWindow = selectedKickWindow(mother);
-  const results = await mapWithConcurrency(members, async (child) => {
+  const results = await mapWithConcurrency(members, (child) => withChildAuthQueue(child, async () => {
     try {
       const teamOwner = teamOwnerRecords(mother).find((owner) => String(owner.email || '').toLowerCase() === String(child.email || '').toLowerCase());
       const selectedToken = workspaceTokenFor(child, mother.accountId) || workspaceTokenFor(child, mother.team);
@@ -4914,7 +5002,7 @@ async function checkTeam(motherId, { childIds = [] } = {}) {
       applyQuotaResult(child, { ok: false, status: 502, message: error?.message || 'quota_probe_failed' }, mother.team, kickWindow, { createMembership: state.settings.delayedKickEnabled && kickWindow !== 'time' });
       return { id: child.id, email: child.email, ok: false, status: 502, message: error?.message || 'quota_probe_failed', quota5h: null, quota7d: null, tokenRecovery: null };
     }
-  });
+  }));
   const successfulRenewals = results.filter((result) => result.tokenRecovery?.ok && result.ok === true);
   const renewedTeamTokens = successfulRenewals.length;
   const renewedEmails = successfulRenewals.map((result) => result.email).filter(Boolean);
@@ -5946,7 +6034,7 @@ function autoAcquireFreeJson(id, onProgress) {
 function storedAutoTeamJsonResult(job, child, mother) {
   const latestMembership = latestMembershipHistoryFor(child, mother.team);
   if (!isChildMemberOfTeam(child, mother.team) || (latestMembership && latestMembership.status !== 'active')
-    || !completeTeamJsonFor(child, mother)) return null;
+    || teamAuthorizationHealth(child, job.workspaceId).retryAuthorization || !completeTeamJsonFor(child, mother)) return null;
   const savedQuota = membershipFor(child, mother.team) || { ...child, team: mother.team, status: 'active' };
   const quota = teamQuotaState({ member: true, workspaceId: job.workspaceId, membership: savedQuota });
   return {
@@ -5962,7 +6050,7 @@ function storedAutoTeamJsonResult(job, child, mother) {
 async function refreshStoredAutoTeamJson(job, child, mother) {
   const latestMembership = latestMembershipHistoryFor(child, mother.team);
   if (!isChildMemberOfTeam(child, mother.team) || (latestMembership && latestMembership.status !== 'active')
-    || !completeTeamJsonFor(child, mother, { allowExpired: true })) return null;
+    || teamAuthorizationHealth(child, job.workspaceId).retryAuthorization || !completeTeamJsonFor(child, mother, { allowExpired: true })) return null;
   const workspaceId = job.workspaceId;
   const email = child.email;
   const userId = child.chatgptUserId;
@@ -5996,6 +6084,9 @@ async function refreshStoredAutoTeamJson(job, child, mother) {
         if (latest?.accessToken !== beforeAccessToken || latest?.refreshToken !== beforeRefreshToken) return fail('team_token_changed');
         const candidate = { ...token, accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken || beforeRefreshToken };
         if (!refreshed.ok || !completeTeamJsonFor({ ...child, workspaceTokens: { [workspaceId]: candidate } }, mother)) {
+          if (membership) membership.authorizationRetryRequired = true;
+          if (confirmedTeamAuthFailure(refreshed)) invalidateTeamToken(child, workspaceId, { code: 'team_token_refresh_failed' });
+          await persist();
           return fail('team_token_refresh_failed', refreshed.status);
         }
         const saved = saveWorkspaceToken(child, workspaceId, refreshed.accessToken, accessTokenClaims(refreshed.accessToken), {
@@ -6170,10 +6261,23 @@ async function autoAcquireTeamJson(job, id) {
         .catch(() => ({ ok: false, status: 502, message: 'quota_query_failed' }));
       return withTeamMaintenanceLock(job.motherId, 'auto_team_json_quota', async () => {
         if (currentFailure()) return currentFailure();
+        if (child.workspaceTokens?.[job.workspaceId] !== teamToken) {
+          // Another refresh/callback may have replaced this authorization while
+          // the quota request was in flight. Its old result cannot validate or
+          // invalidate the newly saved token.
+          const ready = Boolean(completeTeamJsonFor(child, mother));
+          return { ...autoJsonResult(child, { ok: ready, code: ready ? 'ready' : 'team_token_changed' }, context),
+            quotaChecked: false, quotaStatus: 'unknown', quotaCode: 'team_token_changed',
+            message: 'Team 授权已更新，本次旧额度结果未保存，请重新检测额度' };
+        }
         applyQuotaResult(child, quota, mother.team, selectedKickWindow(mother));
         await persist();
         const measured = quota.ok && (quota.primary?.usedPercent != null || quota.secondary?.usedPercent != null);
         const membership = membershipFor(child, mother.team);
+        if (teamAuthorizationHealth(child, job.workspaceId).needsReauthorization) {
+          return { ...autoJsonResult(child, { ok: false, code: 'team_authorization_invalid', status: quota.status }, context),
+            quotaChecked: false, quotaStatus: 'unknown', message: '新获取的 Team 授权未通过额度接口验证，请重新授权' };
+        }
         appendAutoJsonLog(job, child, 'quota', measured ? 'ready' : 'warning', measured ? '真实额度已检测并保存' : '额度查询失败或没有返回额度数据，未填入虚假额度', Number(quota.status));
         return { ...result, phase: 'quota', quotaChecked: Boolean(measured), quotaStatus: measured ? membership?.quotaStatus || 'available' : 'unknown', quota5h: measured ? membership?.quota5h ?? null : null, quota7d: measured ? membership?.quota7d ?? null : null,
           quotaHttpStatus: Number(quota.status) || null, message: measured ? 'Team JSON 已保存，真实额度已检测' : 'Team JSON 已保存，额度查询失败或未返回额度数据，请重试检测' };
@@ -8682,7 +8786,15 @@ async function handleApi(req, res, url) {
     if (!child) return sendJson(res, 404, { message: 'child_not_found' });
     const mother = findMother(body.motherId) || state.mothers.find((item) => item.accountId === String(body.workspaceId || '').trim());
     if (!mother) return sendJson(res, 404, { message: 'mother_not_found' });
+    if (body.manual === true && (typeof body.motherId !== 'string' || !body.motherId.trim()
+      || typeof body.workspaceId !== 'string' || !body.workspaceId.trim() || body.callbackUrl)) {
+      return sendJson(res, 400, { ok: false, code: 'team_auth_scope_required', message: '请指定母号和目标 Team 空间后生成授权链接' });
+    }
+    if (body.motherId && mother.id !== body.motherId || body.workspaceId && configuredTeamId(mother) !== body.workspaceId) {
+      return sendJson(res, 409, { ok: false, code: 'team_workspace_mismatch', message: '母号与目标 Team 不匹配，请刷新列表' });
+    }
     const result = await acquireTeamAuth(mother, child, {
+      manual: body.manual === true,
       force: body.force !== false,
       verificationCode: body.verificationCode,
       callbackUrl: body.callbackUrl,

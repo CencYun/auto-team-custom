@@ -1019,6 +1019,13 @@ class LoginRunner {
   }
 }
 
+// Prepare a resumable PKCE session without running any login or browser flow.
+export async function prepareOAuthAuthorization(options = {}) {
+  const runner = new LoginRunner(options);
+  const authUrl = await runner.prepareAuthorization();
+  return { authUrl, session: publicSession(runner.session) };
+}
+
 export async function loginFreeAccount(options = {}) {
   if (options.callbackUrl) {
     try {

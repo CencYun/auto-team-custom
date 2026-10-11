@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamInviteCandidateState, teamMemberRemovalState, teamAutoJsonCandidates, teamAutoJsonRowTarget } from '../shared/team-workflow-ui.mjs';
+import { isTeamJoinCandidate, teamAuthorizationState, teamAutoJsonState, teamAccountWorkflows, teamInviteCandidateState, teamMemberRemovalState, teamAutoJsonCandidates, teamAutoJsonRowTarget, officialTeamAuthorizationUrl, manualTeamAuthorizationUrl } from '../shared/team-workflow-ui.mjs';
 
 const teamId = 'fixture-workspace';
 const mother = { accountId: teamId, email: 'owner@fixture.test' };
@@ -132,6 +132,82 @@ test('Team JSON ready requires complete unexpired target credentials and actual 
   assert.equal(pending.member, false);
   assert.equal(pending.ready, false, 'an unaccepted invitation cannot expose stale Team credentials as ready');
   assert.equal(teamAutoJsonState({ ...account, teamAuthorizations: [authorization] }, { ...invitationMother, members: [{ email: account.email }] }).ready, true);
+});
+
+test('confirmed invalid Team credentials re-enter single and batch acquisition without changing another Team', () => {
+  const otherMother = { id: 'other-mother', accountId: 'other-workspace' };
+  const joined = {
+    ...account,
+    joinedTeams: [activeMembership, { team: otherMother.accountId, status: 'active' }],
+    teamAuthorizations: [
+      { ...authorization, needsReauthorization: true, login: { workspaceId: teamId, status: 'ready' } },
+      { ...authorization, motherId: otherMother.id, workspaceId: otherMother.accountId },
+    ],
+  };
+  const invalid = teamAutoJsonState(joined, invitationMother);
+  assert.equal(invalid.ready, false);
+  assert.equal(invalid.needsReauthorization, true);
+  assert.equal(invalid.login.code, 'team_reauthorization_required');
+  assert.match(teamAuthorizationState({ ...joined, teamLogin: invalid.login }, teamId).label, /需重新授权/);
+  assert.equal(teamAutoJsonRowTarget(joined, [invitationMother, otherMother], invitationMother.id).ready, false);
+  assert.deepEqual(teamAutoJsonCandidates([joined], invitationMother).map((item) => item.id), [joined.id]);
+  assert.equal(teamAutoJsonState(joined, otherMother).ready, true);
+  assert.deepEqual(teamAutoJsonCandidates([joined], otherMother), []);
+});
+
+test('legacy refresh failure can be retried without claiming confirmed invalid credentials', () => {
+  const joined = {
+    ...account,
+    joinedTeams: [{ ...activeMembership, workspaceTokenStatus: 'ready', lastProbe: { ok: false, status: 403, errorCode: 'team_token_refresh_failed' } }],
+    teamAuthorizations: [{ ...authorization, retryAuthorization: true, needsReauthorization: false, login: { workspaceId: teamId, status: 'ready' } }],
+  };
+  const workflow = teamAutoJsonState(joined, invitationMother);
+  assert.equal(workflow.ready, false);
+  assert.equal(workflow.retryAuthorization, true);
+  assert.equal(workflow.needsReauthorization, false);
+  assert.equal(workflow.login.code, 'team_token_refresh_failed');
+  assert.match(workflow.login.message, /尚未确认凭据失效/);
+  assert.deepEqual(teamAutoJsonCandidates([joined], invitationMother, [joined.id]), [joined]);
+});
+
+test('temporary quota failures and global Free failures never invalidate a healthy scoped Team JSON', () => {
+  for (const lastProbe of [{ ok: false, status: 503 }, { ok: false, status: 429 }, { ok: false, status: 403, errorCode: 'cloudflare_challenge' }, { ok: false, status: 0, errorCode: 'network_timeout' }]) {
+    const joined = {
+      ...account, lastProbe: { ok: false, status: 401 }, teamLogin: { status: 'failed' },
+      joinedTeams: [{ ...activeMembership, workspaceTokenStatus: 'ready', lastProbe }],
+      teamAuthorizations: [{ ...authorization, needsReauthorization: false, retryAuthorization: false }],
+    };
+    assert.equal(teamAutoJsonState(joined, invitationMother).ready, true);
+    assert.deepEqual(teamAutoJsonCandidates([joined], invitationMother), []);
+  }
+});
+
+test('a scoped invalid membership overrides stale successful metadata while preserving a pending manual link', () => {
+  const authUrl = 'https://auth.openai.com/oauth/authorize?state=manual-team';
+  const login = { workspaceId: teamId, status: 'browser_verification_required', browserRequired: true, authUrl };
+  const joined = { ...account, joinedTeams: [{ ...activeMembership, workspaceTokenStatus: 'invalid' }], teamAuthorizations: [{ ...authorization, login }] };
+  const workflow = teamAutoJsonState(joined, invitationMother);
+  assert.equal(workflow.ready, false);
+  assert.equal(workflow.needsReauthorization, true);
+  assert.equal(workflow.login, login);
+  assert.equal(teamAuthorizationState({ ...joined, teamLogin: workflow.login }, teamId).authUrl, authUrl);
+  const staleReady = teamAuthorizationState({ ...joined, teamLogin: { workspaceId: teamId, status: 'ready' } }, teamId);
+  assert.equal(staleReady.pending, true);
+  assert.match(staleReady.label, /需重新授权/);
+});
+
+test('manual authorization links require an official URL and exact account, mother, and workspace response', () => {
+  const target = { id: account.id, motherId: invitationMother.id, workspaceId: teamId };
+  const authUrl = 'https://auth.openai.com/oauth/authorize?state=manual-team';
+  const result = { child: { id: account.id }, motherId: invitationMother.id, workspaceId: teamId, browserRequired: true, authUrl };
+  assert.equal(manualTeamAuthorizationUrl(result, target), authUrl);
+  for (const change of [{ child: { id: 'other-account' } }, { motherId: 'other-mother' }, { workspaceId: 'other-team' }, { browserRequired: false }, { authUrl: 'https://auth.openai.com.attacker.test/authorize' }]) {
+    assert.equal(manualTeamAuthorizationUrl({ ...result, ...change }, target), null);
+  }
+  for (const value of ['javascript:alert(1)', 'http://auth.openai.com/authorize', 'https://user:pass@auth.openai.com/authorize', 'https://auth.openai.com:444/authorize', 'not a URL', null]) {
+    assert.equal(officialTeamAuthorizationUrl(value), null);
+  }
+  assert.equal(manualTeamAuthorizationUrl(result, null), null);
 });
 
 test('old joined invitations and removed membership history do not stay related to a target Team', () => {

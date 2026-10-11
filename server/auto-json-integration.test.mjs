@@ -147,6 +147,10 @@ async function appFixture(t, children, { responses = {}, tokenStatuses = {}, hol
       return json({ success: true });
     }
     if (teamScenario && pathname === '/backend-api/wham/usage') {
+      if (typeof teamScenario.onUsage === 'function') {
+        const response = await teamScenario.onUsage();
+        return json(response.payload || {}, response.status || 200);
+      }
       return teamScenario.quotaFailure ? json({ error: 'quota_forbidden_private_upstream_error' }, 403)
         : teamScenario.malformedQuota ? json({ rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18000, reset_after_seconds: 1e100 } } })
         : json({ rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18000 }, secondary_window: { used_percent: 10, limit_window_seconds: 604800 } } });
@@ -963,6 +967,116 @@ test('Team RT failure or a wrong refreshed token preserves prior JSON and never 
     assert.deepEqual((await app.saved()).children[0].workspaceTokens, child.workspaceTokens);
     assert.doesNotMatch(JSON.stringify(job), /private-original-team-rt|private-fixture-new-rt|private-fixture-signature|upstream-private-message/);
   });
+});
+
+test('legacy 401 rejection and legacy 403 RT blocking both allow explicit Team reauthorization, then healthy JSON skips again', async (t) => {
+  for (const status of [401, 403]) await t.test(String(status), async (t) => {
+    const workspaceId = 'fixture-team-workspace';
+    const child = { id: 'legacy-team-retry', email: 'legacy-team-retry@example.test', password: 'private-retry-password',
+      chatgptUserId: 'legacy-team-retry', team: workspaceId,
+      workspaceHistory: [{ team: workspaceId, status: 'active', workspaceTokenStatus: 'ready', quota5h: 75, quota7d: 80,
+        lastProbe: { ok: false, status, errorCode: 'team_token_refresh_failed' } }],
+      workspaceTokens: { [workspaceId]: { accessToken: token('legacy-team-retry@example.test', 'legacy-team-retry', { workspaceId, plan: 'team' }).access_token,
+        refreshToken: 'private-original-invalid-rt' } } };
+    const app = await appFixture(t, [child], { credentialChild: child, mothers: [teamOwner()], roxyEnabled: true,
+      teamScenario: { noMfa: true, members: [ownerMember(), { id: child.id, email: child.email, role: 'standard-user', seat_type: 'default' }] } });
+    const initial = (await app.request('/api/state')).data.children[0].teamAuthorizations[0];
+    assert.equal(initial.needsReauthorization, status === 401);
+    assert.equal(initial.retryAuthorization, true);
+    const body = { scope: 'team', motherId: 'fixture-mother', ids: [child.id], retryAccount: true };
+    const completed = await app.finish((await app.start(body)).job.id);
+    assert.equal(completed.succeeded, 1, JSON.stringify(completed.results));
+    assert.equal(completed.results[0].reused, false);
+    assert.equal(app.paths.filter((entry) => entry === '/oauth/authorize').length, 1);
+    assert.equal(app.grants.some((entry) => entry.type === 'refresh_token'), false);
+    const saved = (await app.saved()).children[0];
+    assert.equal(saved.workspaceHistory[0].workspaceTokenInvalid, false);
+    assert.equal(saved.workspaceHistory[0].authorizationRetryRequired, false);
+    const requestCount = app.requests.length;
+    const repeated = await app.finish((await app.start(body)).job.id);
+    assert.equal(repeated.results[0].reused, true);
+    assert.equal(app.requests.length, requestCount);
+  });
+});
+
+test('manual Team link needs no login, reuses scoped PKCE and accepts only its matching verified callback', async (t) => {
+  const workspaceId = 'fixture-team-workspace';
+  const child = { id: 'manual-link', email: 'manual-link@example.test', chatgptUserId: 'manual-link', team: workspaceId,
+    workspaceHistory: [{ team: workspaceId, status: 'active', workspaceTokenStatus: 'invalid', workspaceTokenInvalid: true,
+      quota5h: 75, quota7d: 80, lastProbe: { ok: false, status: 401, errorCode: 'team_token_refresh_failed' } }],
+    workspaceTokens: { [workspaceId]: { accessToken: token('manual-link@example.test', 'manual-link', { workspaceId, plan: 'team' }).access_token,
+      refreshToken: 'private-old-manual-rt' }, 'other-team': { accessToken: 'private-other-team-token', refreshToken: 'private-other-team-rt' } },
+    authSession: { state: 'private-independent-free-session', codeVerifier: 'private-free-verifier' } };
+  const app = await appFixture(t, [child], { mothers: [teamOwner()], roxyEnabled: true,
+    responses: { 'manual-team-code': token(child.email, child.id, { workspaceId, plan: 'team' }) } });
+  const route = `/api/children/${child.id}/team-auth`;
+  const body = { motherId: 'fixture-mother', workspaceId, manual: true };
+  assert.equal((await app.request(route, { method: 'POST', body: { ...body, workspaceId: 'other-team' } })).status, 409);
+  const first = await app.request(route, { method: 'POST', body });
+  assert.equal(first.status, 200);
+  assert.equal(first.data.browserRequired, true);
+  const session = (await app.saved()).children[0].teamAuthSessions[workspaceId];
+  assert.ok(session.state && session.codeVerifier);
+  assert.equal(new URL(first.data.authUrl).searchParams.get('code_challenge'), createHash('sha256').update(session.codeVerifier).digest('base64url'));
+  const repeated = await app.request(route, { method: 'POST', body });
+  assert.equal(repeated.data.authUrl, first.data.authUrl);
+  assert.deepEqual((await app.saved()).children[0].teamAuthSessions[workspaceId], session);
+  assert.equal(app.requests.length, 0);
+  const wrong = await app.request(route, { method: 'POST', body: { motherId: body.motherId, workspaceId,
+    callbackUrl: 'http://localhost:1455/auth/callback?code=manual-team-code&state=wrong-state' } });
+  assert.equal(wrong.data.ok, false);
+  assert.equal(app.requests.length, 0);
+  const completed = await app.request(route, { method: 'POST', body: { motherId: body.motherId, workspaceId,
+    callbackUrl: `http://localhost:1455/auth/callback?code=manual-team-code&state=${session.state}` } });
+  assert.equal(completed.status, 200);
+  assert.deepEqual(app.paths, ['/token']);
+  assert.equal(app.grants[0].verifier, session.codeVerifier);
+  const saved = (await app.saved()).children[0];
+  assert.deepEqual(saved.authSession, child.authSession);
+  assert.deepEqual(saved.workspaceTokens['other-team'], child.workspaceTokens['other-team']);
+  assert.equal(saved.workspaceHistory[0].quota5h, 75);
+  assert.equal(saved.workspaceHistory[0].workspaceTokenInvalid, false);
+  assert.equal(saved.teamAuthSessions[workspaceId], undefined);
+  const authorization = completed.data.child.teamAuthorizations.find((entry) => entry.workspaceId === workspaceId);
+  assert.equal(authorization.ready, true);
+  assert.equal(authorization.needsReauthorization, false);
+  assert.equal(authorization.retryAuthorization, false);
+  assert.doesNotMatch(JSON.stringify(first.data), /private-|codeVerifier|password/);
+});
+
+test('an automatic JSON quota response cannot invalidate a newer successful manual callback', async (t) => {
+  const workspaceId = 'fixture-team-workspace';
+  const child = { id: 'late-auto-quota', email: 'late-auto-quota@example.test', password: 'private-password',
+    chatgptUserId: 'late-auto-quota', team: workspaceId, workspaceHistory: [{ team: workspaceId, status: 'active', quota5h: 75, quota7d: 80 }] };
+  let announceProbe;
+  let releaseProbe;
+  const startedProbe = new Promise((resolve) => { announceProbe = resolve; });
+  const probeGate = new Promise((resolve) => { releaseProbe = resolve; });
+  t.after(() => releaseProbe());
+  const replacement = token(child.email, child.id, { workspaceId, plan: 'team', expiresIn: 7200 });
+  const app = await appFixture(t, [child], { credentialChild: child, mothers: [teamOwner()], roxyEnabled: true,
+    responses: { 'manual-team-code': replacement }, teamScenario: { noMfa: true,
+      members: [ownerMember(), { id: child.id, email: child.email, role: 'standard-user', seat_type: 'default' }],
+      onUsage: async () => { announceProbe(); await probeGate; return { status: 401, payload: { error: 'invalid_token' } }; },
+    } });
+  const job = await app.start({ scope: 'team', motherId: 'fixture-mother', ids: [child.id] });
+  await startedProbe;
+  const route = `/api/children/${child.id}/team-auth`;
+  const scope = { motherId: 'fixture-mother', workspaceId };
+  const link = await app.request(route, { method: 'POST', body: { ...scope, manual: true } });
+  const oauthState = new URL(link.data.authUrl).searchParams.get('state');
+  const completed = await app.request(route, { method: 'POST', body: { ...scope,
+    callbackUrl: `http://localhost:1455/auth/callback?code=manual-team-code&state=${oauthState}` } });
+  assert.equal(completed.data.ok, true);
+  releaseProbe();
+  const finished = await app.finish(job.job.id);
+  assert.equal(finished.succeeded, 1);
+  assert.equal(finished.results[0].quotaCode, 'team_token_changed');
+  const saved = (await app.saved()).children[0];
+  assert.equal(saved.workspaceTokens[workspaceId].accessToken, replacement.access_token);
+  assert.equal(saved.workspaceHistory[0].workspaceTokenInvalid, false);
+  assert.notEqual(saved.workspaceHistory[0].lastProbe?.status, 401);
+  assert.equal(saved.workspaceHistory[0].quota5h, 75);
 });
 
 test('serial Team batch settles failures once, continues to the next account and explicitly retries only selected failures', async (t) => {
