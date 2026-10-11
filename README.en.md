@@ -31,7 +31,7 @@ npm run build
 npm run server
 ```
 
-Open <http://127.0.0.1:8786/> and sign in with the default password `daixuteam`. You can also select **Code → Download ZIP** on the repository page, extract it, and run the last three commands from the project directory. A fresh installation starts with empty data; import your own accounts and configure service connections. Roxy authorization requires a separate Roxy installation and local API configuration.
+Open <http://127.0.0.1:8786/> and sign in with the default password `xiaoyu`. You can also select **Code → Download ZIP** on the repository page, extract it, and run the last three commands from the project directory. A fresh installation starts with empty data; import your own accounts and configure service connections. Roxy authorization requires a separate Roxy installation and local API configuration.
 
 ## Development
 
@@ -46,7 +46,7 @@ In another terminal, start Vite:
 npm run dev
 ```
 
-Open <http://localhost:5173> in your browser and sign in with the default password `daixuteam`. Development requires both `npm run server` and `npm run dev`: Vite proxies `/api` to the local API server.
+Open <http://localhost:5173> in your browser and sign in with the default password `xiaoyu`. Development requires both `npm run server` and `npm run dev`: Vite proxies `/api` to the local API server.
 
 For deployment with the built page served by the API process, build and start the server:
 
@@ -65,7 +65,7 @@ For each release, update the semantic version in `package.json` and `package-loc
 
 ## Security Notes
 
-- The dashboard's default password is `daixuteam`; set `TEAM_ROTATION_LOGIN_PASSWORD` before starting the server to override it. Use a strong replacement for remote deployments. Login creates a seven-day, HttpOnly, SameSite=Lax cookie scoped to `/api`. Sessions live in server memory, so a server restart requires signing in again; logout invalidates the current session.
+- The dashboard's default password is `xiaoyu`; set `TEAM_ROTATION_LOGIN_PASSWORD` before starting the server to override it. Use a strong replacement for remote deployments. Login creates a seven-day, HttpOnly, SameSite=Lax cookie scoped to `/api`. Sessions live in server memory, so a server restart requires signing in again; logout invalidates the current session.
 - Keep passwords, 2FA secrets, access tokens, and refresh tokens on a controlled server.
 - The server listens on `127.0.0.1` by default. Non-loopback `HOST` requires `TEAM_ROTATION_API_TOKEN` and `TEAM_ROTATION_DATA_KEY`. Dashboard login does not replace the API token: protected requests from the signed-in dashboard still need it when configured. The browser stores the token only for the current session and clears it on logout. Programmatic HTTP clients with a valid API token do not need a dashboard cookie session. Use HTTPS behind a reverse proxy for remote access.
 - MCP authentication is independent of dashboard login. It continues to use `TEAM_ROTATION_API_TOKEN` by default, with `MCP_AUTH_TOKEN` available as an override.

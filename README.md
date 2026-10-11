@@ -43,7 +43,7 @@ npm run build
 npm run server
 ```
 
-打开 <http://127.0.0.1:8786/>，使用默认密码 `daixuteam` 登录。不使用 Git 时，也可以在仓库页面选择 **Code → Download ZIP**，解压后在项目目录执行最后三条命令。首次启动是空数据，需要自行导入账号和配置服务连接；Roxy 自动授权需要另行安装 Roxy 并配置其本机 API。
+打开 <http://127.0.0.1:8786/>，使用默认密码 `xiaoyu` 登录。不使用 Git 时，也可以在仓库页面选择 **Code → Download ZIP**，解压后在项目目录执行最后三条命令。首次启动是空数据，需要自行导入账号和配置服务连接；Roxy 自动授权需要另行安装 Roxy 并配置其本机 API。
 
 ## 开发启动
 
@@ -58,7 +58,7 @@ npm run server
 npm run dev
 ```
 
-然后打开 <http://localhost:5173>，使用默认密码 `daixuteam` 登录。开发模式需要同时运行 `npm run server` 和 `npm run dev`：Vite 将 `/api` 代理至本机服务端。前端和服务端默认从空状态启动，不包含预置母号、子号或历史记录。数据以服务端 `data/state.json` 为准；该文件使用 AES-256-GCM 加密，可以在“设置”中调整预警阈值和轮询周期。
+然后打开 <http://localhost:5173>，使用默认密码 `xiaoyu` 登录。开发模式需要同时运行 `npm run server` 和 `npm run dev`：Vite 将 `/api` 代理至本机服务端。前端和服务端默认从空状态启动，不包含预置母号、子号或历史记录。数据以服务端 `data/state.json` 为准；该文件使用 AES-256-GCM 加密，可以在“设置”中调整预警阈值和轮询周期。
 
 前端不会生成演示账号。Free 账号可以通过“导入 Sub2API JSON”导入真实 `accounts[].credentials` 和 `accounts[].extra`，也可以粘贴 `邮箱----密码----2FA`（或使用 `|`、逗号）保存已完成手机号验证的登录凭据。开启自动补位后，没有 Free JSON 的账号会先通过 RT 或邮箱、密码、2FA 完成 Codex OAuth；已有 AT 过期时优先用 RT 刷新。遇到额外邮箱验证码、Turnstile 或浏览器设备校验时不会伪造成功，界面会保留验证状态。JSON 的完整凭据只提交并加密保存在服务端，界面和 API 响应只返回脱敏 token。
 
@@ -83,7 +83,7 @@ npm run server
 
 ## 安全配置
 
-- 管理台默认登录密码是 `daixuteam`；启动服务端前设置 `TEAM_ROTATION_LOGIN_PASSWORD` 可覆盖。远程部署应更换强密码。登录成功后使用路径为 `/api` 的 HttpOnly、SameSite=Lax Cookie，会话有效期 7 天并仅保存在服务端内存中；服务端重启后需要重新登录，退出会使当前会话失效。
+- 管理台默认登录密码是 `xiaoyu`；启动服务端前设置 `TEAM_ROTATION_LOGIN_PASSWORD` 可覆盖。远程部署应更换强密码。登录成功后使用路径为 `/api` 的 HttpOnly、SameSite=Lax Cookie，会话有效期 7 天并仅保存在服务端内存中；服务端重启后需要重新登录，退出会使当前会话失效。
 - 默认只监听 `127.0.0.1`。设置非本机 `HOST` 时，必须同时设置 `TEAM_ROTATION_API_TOKEN`，否则服务拒绝启动。管理台登录不替代 API Token：配置了 Token 时，页面登录后访问受保护 API 仍需输入 Token，Token 仅保存到当前浏览器会话并在退出时清除。携带有效 Token 的程序化 HTTP 客户端可不建立管理台 Cookie 会话。
 - 状态文件默认使用 `data/.state-key` 加密；非本机监听必须设置独立的 `TEAM_ROTATION_DATA_KEY`（32 字节 Base64、64 位十六进制或高强度口令），并单独备份该密钥。密钥丢失后无法解密状态数据。
 - 跨域前端通过 `TEAM_ROTATION_ALLOWED_ORIGINS` 配置允许来源，多个来源使用逗号分隔。默认只允许同源以及本机 Vite 开发地址。
